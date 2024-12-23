@@ -7,6 +7,7 @@ from transformers import (
     AutoProcessor
 )
 import torch
+from torchvision import transforms
 
 class CustomDataset(torch.utils.data.Dataset):
     """
@@ -25,7 +26,7 @@ class CustomDataset(torch.utils.data.Dataset):
         """
         self.task_name = task_name
         self.split = split
-        self.data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data"))
+        self.data_dir = "../data"
 
         # Create data directory if it doesn't exist
         if not os.path.exists(self.data_dir):
@@ -43,14 +44,8 @@ class CustomDataset(torch.utils.data.Dataset):
         self.vit_name = "google/vit-base-patch16-224"
         self.wav2vec2_name = "facebook/wav2vec2-base"
 
-        # Check if processed dataset already exists
-        if os.path.exists(self.processed_path):
-            # Load from disk
-            self.dataset = load_from_disk(self.processed_path)
-        else:
-            # Need to load, process, and save
-            self.dataset = self._prepare_dataset()
-            self.dataset.save_to_disk(self.processed_path)
+        self.dataset = self._prepare_dataset()
+        #self.dataset.save_to_disk(self.processed_path)
 
         # Now select the split
         if self.split not in self.dataset:
@@ -106,15 +101,19 @@ class CustomDataset(torch.utils.data.Dataset):
 
         elif self.task_name == "cifar100":
             raw = load_dataset("cifar100")
-            image_processor = AutoImageProcessor.from_pretrained(self.vit_name)
             
+            image_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
+
             def preprocess_cifar100(example):
-                inputs = image_processor(example["img"], return_tensors="np")
-                return {
-                    "input_values": inputs["pixel_values"][0],
-                    "labels": example["fine_label"]
-                }
-            processed = raw.map(preprocess_cifar100, batched=False, remove_columns=raw["train"].column_names)
+                example["pixel_values"] = image_transform(example["img"])
+                example["labels"] = example["fine_label"]
+                return example
+
+            processed = raw.with_transform(preprocess_cifar100)
 
         elif self.task_name == "superb_ic":
             raw = load_dataset("superb", "ic")
@@ -140,22 +139,17 @@ class CustomDataset(torch.utils.data.Dataset):
         # We'll consider 'validation' as 'test' if no test split available.
         # Check splits
         split_names = processed.keys()
-        if "test" not in split_names:
-            # If no test split, try validation as test
-            if "validation" in split_names:
-                processed = DatasetDict({
-                    "train": processed["train"],
-                    "test": processed["validation"]
-                })
-            else:
-                # If there's no separate test split at all, just duplicate train as test
-                processed = DatasetDict({
-                    "train": processed["train"],
-                    "test": processed["train"]
-                })
+        if "validation" in split_names:
+            processed = DatasetDict({
+                "train": processed["train"],
+                "test": processed["validation"]
+            })
         else:
-            # Keep as is if test is present
-            pass
+            processed = DatasetDict({
+                "train": processed["train"],
+                "test": processed["test"]
+            })
+
 
         return processed
 
