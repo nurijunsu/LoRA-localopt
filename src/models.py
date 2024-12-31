@@ -3,10 +3,12 @@ from transformers import RobertaForSequenceClassification, ViTForImageClassifica
 
 class Model_Pretrained:
     def __init__(self, model_name: str, dataset_name: str):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model_name = model_name.lower()
         self.dataset_name = dataset_name.lower()
         self.valid_roberta_datasets = ['sst2', 'qnli', 'qqp']
         self.model = self._load_and_modify_model()
+        
         
     def _validate_combination(self):
         if self.model_name == 'roberta':
@@ -25,14 +27,14 @@ class Model_Pretrained:
         if self.model_name == 'roberta':
             model = RobertaForSequenceClassification.from_pretrained("roberta-base", num_labels=2)
         else:  # vit
-            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=100)
+            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=100, ignore_mismatched_sizes=True)
         
         # Freeze all parameters
         for param in model.parameters():
             param.requires_grad = False
             
         # Load custom head weights
-        head_path = f"../pretrained_models/model_{self.dataset_name}/linear_head.pt"
+        head_path = f"../pretrained_models/model_{self.dataset_name}/classification_head.pt"
         head_state = torch.load(head_path)
         
         # Update classification head
@@ -46,7 +48,7 @@ class Model_Pretrained:
             model.classifier.weight.data = head_state['weight']
             model.classifier.bias.data = head_state['bias']
             print("Loaded linear classification head for ViT")
-        return model.to(self.device)
+        return model
 
     def get_model(self):
         return self.model

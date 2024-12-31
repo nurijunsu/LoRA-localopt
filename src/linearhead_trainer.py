@@ -14,7 +14,7 @@ from torchvision import transforms
 import numpy as np
 import transformers
 from transformers.utils import logging
-from sklearn.linear_model import LinearRegression, LogisticRegressionCV
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from dataset import CustomDataset
 from typing import Optional
 import logging
@@ -72,43 +72,34 @@ class LinearHeadTrainer:
         self.dataset_name = dataset_name
         self.model = self.model.to(self.device)
 
-    def collect_features(self, dataset):
-        """
-        For non-Roberta models, we can keep the feature-extraction + scikit-learn approach.
-        This method collects features from the penultimate layer and the corresponding labels.
-        """
+    def collect_features(self, dataset, batch_size=512):
         features = []
         targets = []
 
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         self.model.eval()
+
         with torch.no_grad():
-            for i in range(len(dataset)):
-                inputs = dataset[i]
-                tensor_inputs = {}
-                for k, v in inputs.items():
-                    v = torch.tensor(v).to(self.device) if not torch.is_tensor(v) else v.to(self.device)
-                    if k != "labels":
-                        # For single-example processing, unsqueeze to [1, seq_length]
-                        v = v.unsqueeze(0)
-                    tensor_inputs[k] = v
+            for batch in tqdm(dataloader):
+                # Move inputs to the correct device
+                pixel_values = batch["pixel_values"].to(self.device)
+                labels = batch["labels"].to(self.device)
 
-                feature = extract_features(self.model, **tensor_inputs)
-                
-                # Collect features and labels on CPU to save GPU memory
+                # Extract features
+                feature = extract_features(self.model, pixel_values=pixel_values)
                 features.append(feature.cpu())
-                targets.append(tensor_inputs["labels"].cpu())
+                targets.append(labels.cpu())
 
-        # Concatenate on CPU
         features = torch.cat(features, dim=0)
         targets = torch.cat(targets, dim=0)
-        
+
         return features.numpy(), targets.numpy()
 
     def train_roberta_class_head(
         self,
         epochs: int = 10,
-        lr: float = 1e-3,
-        batch_size: int = 128
+        lr: float = 5e-4,
+        batch_size: int = 256
     ):
         """
         Standard PyTorch training loop for RobertaForSequenceClassification,
@@ -178,25 +169,30 @@ class LinearHeadTrainer:
         """
         if isinstance(self.model, transformers.RobertaForSequenceClassification):
             logger.info("Detected RobertaForSequenceClassification. Training its two-layer MLP head directly.")
-            self.train_roberta_class_head(epochs=10, lr=1e-3, batch_size=128)
+            self.train_roberta_class_head(epochs=20, lr=1e-3, batch_size=128)
             return None  # We don't return a scikit-learn model
         else:
             logger.info("Starting to collect features for training dataset (non-RoBERTa)")
             features, targets = self.collect_features(self.train_dataset)
+            print(f"Features shape: {features.shape}")  # Expected: (N, D)
+            print(f"Targets shape: {targets.shape}")    # Expected: (N,)
             
             # Decide if regression or classification
             if self.model.num_labels == 1:  # Regression
                 targets = torch.tensor(targets).squeeze().unsqueeze(-1).float()
                 reg = LinearRegression().fit(features, targets)
             else:  # Classification
-                reg = LogisticRegressionCV(
-                    max_iter=5000,
+                logger.info("Fitting regression model")
+                reg = LogisticRegression(
+                    C=1.0,
+                    solver="saga",
+                    max_iter=200,
                     multi_class="multinomial",
-                    random_state=0
+                    n_jobs=-1,
+                    random_state=0,
+                    verbose=1  # Add verbosity
                 ).fit(features, targets)
 
-            logger.info("Fitting regression model")
-            
             # Assign weights to model
             decoder = get_token_prediction_layer(self.model)
             coef_torch = torch.tensor(reg.coef_, device=self.device, dtype=decoder.weight.dtype)
@@ -260,13 +256,16 @@ class LinearHeadTrainer:
                 "labels": labels.to(self.device),
             }
 
-        eval_loader = DataLoader(dataset, batch_size=64, shuffle=False, collate_fn=collate_fn)
-
+        if isinstance(self.model, transformers.RobertaForSequenceClassification):
+            eval_loader = DataLoader(dataset, batch_size=256, shuffle=False, collate_fn=collate_fn)
+        else:
+            eval_loader = DataLoader(dataset, batch_size=256, shuffle=False)
         all_predictions = []
         all_targets = []
 
         with torch.no_grad():
             for batch in eval_loader:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
                 outputs = self.model(**batch)
                 predictions = outputs.logits
                 all_predictions.append(predictions)
@@ -299,27 +298,30 @@ def check_labels(dataset, dataset_name="Dataset"):
 # ----------------------------------------------------------------------
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+    print(f"Using device: {device}")
+    from models import Model_Pretrained
     # Choose a task
-    for task_name in ["sst2", "qnli", "qqp", "cifar100"]:  # e.g., "sst2", "qnli", "qqp", "cifar100", "superb_ic"
-        print(f"Using device: {device}")
+    for task_name in ["cifar100"]:  # e.g., "sst2", "qnli", "qqp", "cifar100", "superb_ic"
         # Create custom datasets
         train_dataset = CustomDataset(task_name=task_name, split="train")
         test_dataset = CustomDataset(task_name=task_name, split="test")
         
         print("Datasets Created")
 
-        check_labels(train_dataset.dataset_split, "Train Dataset")
-        check_labels(test_dataset.dataset_split, "Test Dataset")
+        # check_labels(train_dataset.dataset_split, "Train Dataset")
+        # check_labels(test_dataset.dataset_split, "Test Dataset")
 
         if task_name == "cifar100":
-            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=100)
+            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=100, ignore_mismatched_sizes=True)
         else:
             # # # Example: Using RobertaForSequenceClassification with 2 labels
-            model = RobertaForSequenceClassification.from_pretrained("roberta-base", num_labels=2)
+            model = RobertaForSequenceClassification.from_pretrained("roberta-base", num_labels=2, ignore_mismatched_sizes=True)
         print("Model loaded")
-            
-        # Initialize trainer
+
+        
+        model_loader = Model_Pretrained("vit",task_name)  
+        model = model_loader.get_model()
+        #Initialize trainer
         linearheadtrainer = LinearHeadTrainer(
             model=model,
             train_dataset=train_dataset,
@@ -328,9 +330,9 @@ def main():
             dataset_name=task_name
         )
         
-        # Train
-        print("Starting training...")
-        linearheadtrainer.train()  # Automatically chooses the roberta 2-layer MLP path
+        # # Train
+        # print("Starting training...")
+        # linearheadtrainer.train() 
         
         # Evaluate
         print("Evaluating...")

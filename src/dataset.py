@@ -8,6 +8,7 @@ from transformers import (
 )
 import torch
 from torchvision import transforms
+import numpy as np
 
 class CustomDataset(torch.utils.data.Dataset):
     """
@@ -51,6 +52,11 @@ class CustomDataset(torch.utils.data.Dataset):
         if self.split not in self.dataset:
             raise ValueError(f"Split {self.split} not found in dataset {self.task_name}. Available splits: {list(self.dataset.keys())}")
         self.dataset_split = self.dataset[self.split]
+        self.image_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
 
     def _prepare_dataset(self):
         # Load raw datasets from HuggingFace Hub
@@ -100,20 +106,8 @@ class CustomDataset(torch.utils.data.Dataset):
             processed = raw.map(preprocess_qqp, batched=False, remove_columns=raw["train"].column_names)
 
         elif self.task_name == "cifar100":
-            raw = load_dataset("cifar100")
-            
-            image_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-            ])
+            processed = load_dataset("cifar100")
 
-            def preprocess_cifar100(example):
-                example["pixel_values"] = image_transform(example["img"])
-                example["labels"] = example["fine_label"]
-                return example
-
-            processed = raw.with_transform(preprocess_cifar100)
 
         elif self.task_name == "superb_ic":
             raw = load_dataset("superb", "ic")
@@ -157,4 +151,23 @@ class CustomDataset(torch.utils.data.Dataset):
         return len(self.dataset_split)
 
     def __getitem__(self, idx):
-        return self.dataset_split[idx]
+        item = self.dataset_split[idx] 
+
+        if self.task_name == "cifar100":
+            pixel_values = self.image_transform(item["img"])
+            labels = item["fine_label"]
+            
+            return {
+                "pixel_values": pixel_values,
+                "labels": labels
+            }
+        else:
+            # For NLP or other tasks:
+            return item
+
+    
+if __name__ == "__main__":
+    from datasets import load_dataset
+
+    raw = load_dataset("cifar100")
+    print(type(raw["train"][0]["img"]))  # Should ideally be <class 'PIL.Image.Image'>
