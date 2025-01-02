@@ -33,28 +33,29 @@ model = model_loader.get_model()
 print("Model Loaded")
 
 project_name=f'global_minimizer_rank_{task_name}'
+tuning_weights = 'one'# one, last, or all
+lmbda = 1
 
-for tuning_weights in ['one', 'last','all']:
-    for lmbda in [2e-1,1e-2,1e-3]:
-        #Initialize trainer
-        trainer= FineTuningTrainer(                                                                                                                                                          
-                model = model,
-                train_dataset = train_dataset,
-                test_dataset= test_dataset,
-                tuning_weights= tuning_weights,    # one, last, or all
-                rank = 0,
-                lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
-                local_initialization= True,
-                num_epochs = 100,
-                learning_rate= 1e-2,
-                batch_size=256,
-                device = device,
-                project_name=None
-            )
+for lmbda in [0.1, 0.05, 0.03, 0.01]:
+    #Initialize trainer
+    trainer= FineTuningTrainer(                                                                                                                                                          
+            model = model,
+            train_dataset = train_dataset,
+            test_dataset= test_dataset,
+            tuning_weights= tuning_weights,    
+            rank = 0,
+            lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
+            local_initialization= True,
+            num_epochs = 100,
+            learning_rate= 5e-3,
+            batch_size=128,
+            device = device,
+            project_name=project_name
+        )
 
-        trainer.train()
+    trainer.train()
 
-        # Evaluate
-        print("Evaluating...")
-        metrics = trainer.evaluate()
-        print(f"Evaluation metrics: {metrics}")
+# Evaluate
+print("Evaluating...")
+metrics = trainer.evaluate()
+print(f"Evaluation metrics: {metrics}")

@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader
 import transformers
 from tqdm import tqdm
 import os
 import wandb
 import json
+from torch.cuda.amp import GradScaler, autocast
 
 class LoRALayer(nn.Linear):
     #LoRA implementation for a linear layer
@@ -32,6 +33,7 @@ class LoRALayer(nn.Linear):
                                       )
         self.scaling = self.lora_alpha / self.r if self.r!=0 else 0
         self.weight.requires_grad = False
+        self.bias.requires_grad = False
         self.local_init = local_init
 
         self.reset_parameters()
@@ -45,10 +47,9 @@ class LoRALayer(nn.Linear):
                 nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
                 nn.init.zeros_(self.lora_B)
             else: 
-                nn.init.kaiming_uniform_(self.lora_A, a = 1000)
-                nn.init.kaiming_uniform_(self.lora_B, a = 1000)
-        if hasattr(self, 'delta'):
-            nn.init.kaiming_uniform(self.delta, a=2)
+                nn.init.kaiming_uniform_(self.lora_A, a = 10)
+                nn.init.kaiming_uniform_(self.lora_B, a = 10)
+
     
     def forward(self, x:torch.Tensor):
         result = F.linear(x, self.weight, bias=self.bias)
@@ -75,8 +76,9 @@ class FineTuningTrainer:
         lmbda: float = 0.01,            # Weight decay OR nuclear-norm coefficient
         local_initialization: bool = True,
         num_epochs: int = 3,
-        learning_rate: float = 2e-5,
+        learning_rate: float = 5e-3,
         batch_size:int = 32,
+        grad_clip: float = 10.0,
         device: str = "cuda",
         project_name: str = None,
         log_dir : str = None
@@ -98,11 +100,12 @@ class FineTuningTrainer:
         self.test_dataset = test_dataset
         self.tuning_weights = tuning_weights
         self.rank = rank
-        self.lmbda = lmbda if rank == 0 else 0.0
+        self.lmbda = lmbda 
         self.local_initialization = local_initialization
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
         self.batch_size = batch_size
+        self.grad_clip = grad_clip
         self.device = device
         self.project_name = project_name                                                                
 
@@ -110,8 +113,12 @@ class FineTuningTrainer:
         self.configure_layers()
         self.model = self.model.to(device)
         # 2. Build optimizer (and optionally a scheduler)
-        self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, weight_decay=self.lmbda if self.rank > 0 else 0.0)
-        self.lr_scheduler = None  # if you want, define a scheduler
+        if self.rank > 0:
+            self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.9)
+        else:
+            self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum=0.9)
+        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
+        self.train_loss = 0
 
         # Wandb logging
         self.project_name = project_name
@@ -128,7 +135,8 @@ class FineTuningTrainer:
             'lambda': lmbda,
             'lr' : learning_rate,
             'batch_size' : batch_size,
-            'epochs' : num_epochs
+            'epochs' : num_epochs,
+            'optimizer' : self.optimizer.__class__.__name__
         }
         self.save_config()
         if project_name is not None:
@@ -140,8 +148,8 @@ class FineTuningTrainer:
         with open(config_path, 'w') as json_file:
             json.dump(self.config, json_file, indent=4)
 
-    def save_model(self):
-        save_path = f"{self.log_dir}/lambda_{self.lmbda}_epoch_{self.num_epochs}_lr.pth"
+    def save_model(self, epochs):
+        save_path = f"{self.log_dir}/lambda_{self.lmbda}_epoch_{epochs}_lr.pth"
         torch.save(self.model.state_dict(), save_path)
         print(f"Model weights saved to {save_path}")
 
@@ -268,7 +276,7 @@ class FineTuningTrainer:
                 # 1D or scalar param => skip or treat as vector norm
                 continue
             # Flatten the 2D (or more) into 2D for SVD
-            mat = param.view(param.shape[0], -1).detach()
+            mat = param.view(param.shape[0], -1)
             # Avoid computing large SVD on huge dims if not needed, 
             # but let's do it for demonstration
             _, S, _ = torch.svd(mat)  # or torch.linalg.svd in newer PyTorch
@@ -284,18 +292,47 @@ class FineTuningTrainer:
         # For demonstration, let's sum rank across all trainable params.
         # The rank is the number of singular values above a threshold, e.g. 1e-5.
         rank = []
-        threshold = 1e-8
-        for param in params_list:
-            if param.ndim < 2:
-                continue
-            mat = param.view(param.shape[0], -1).detach()
-            _, R = torch.linalg.qr(mat, mode="r")
-            rank.append(torch.sum(torch.abs(torch.diag(R)) > threshold).item())
+        if self.rank == 0:
+            for param in params_list:
+                if param.ndim < 2:
+                    continue
+                # Reshape and detach the parameter for SVD computation
+                mat = param.view(param.shape[0], -1).detach()
+                # Perform SVD
+                _, S, _ = torch.linalg.svd(mat, full_matrices=False)
+                # Compute rank based on the threshold
+                threshold = 1e-3 * S[0]
+                rank.append(torch.sum(S > threshold).item())
+                indices = (S > threshold).nonzero(as_tuple=True)[0]
+                smallest_index = indices[-1].item()
+                start = max(0, smallest_index - 2)
+                end = min(len(S), smallest_index +2)
+                nearby_singular_values = S[start:end]
+                print(f"Singular values around the threshold at index {smallest_index}: {nearby_singular_values}")
+        else:
+            for i in range(0, len(params_list), 2):
+                A = params_list[i]     # Get A matrix
+                B = params_list[i+1]   # Get B matrix
+                mat = B @ A  # Compute the matrix product
+                # Perform SVD
+                _, S, _ = torch.linalg.svd(mat, full_matrices=False)
+                threshold = 1e-3 * S[0]
+                # Compute rank based on the threshold
+                rank.append(torch.sum(S > threshold).item())
+
+                indices = (S > threshold).nonzero(as_tuple=True)[0]
+                smallest_index = indices[-1].item()
+                start = max(0, smallest_index - 2)
+                end = min(len(S), smallest_index +2)
+                nearby_singular_values = S[start:end]
+                print(f"Singular values around the threshold at index {smallest_index}: {nearby_singular_values}")
+
         return rank
 
     
     
     def train(self):
+
         # def hook_fn(module, input, output):
         #     print(f"[Hook] Module: {module.__class__.__name__}")
         #     print(f"Input Shapes: {[i.shape for i in input if isinstance(i, torch.Tensor)]}")
@@ -304,6 +341,7 @@ class FineTuningTrainer:
         # # Register hooks for all modules in the model
         # for name, module in self.model.named_modules():
         #     module.register_forward_hook(hook_fn)
+        scaler = GradScaler()
 
         for epoch in range(self.num_epochs):
             self.model.train()
@@ -336,36 +374,33 @@ class FineTuningTrainer:
                     shuffle=True,
                 )
 
-            trainable_params = []
-            all_param = 0
-            for name, param in self.model.named_parameters():
-                all_param += param.numel()
-                if param.requires_grad:
-                    trainable_params.append((name, param.shape))
-                    print(f"Training: {name}, Shape: {param.shape}")
-
             for batch in tqdm(train_loader):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 self.optimizer.zero_grad()
                 # forward pass
-                outputs = self.model(**batch)
-                vanilla_loss = outputs.loss
+                with autocast():
+                    outputs = self.model(**batch)
+                    vanilla_loss = outputs.loss
 
-                # If not using LoRA, apply nuclear norm regularization
-                if self.rank == 0:
-                    # Only apply nuclear norm to the Q/V weights we are training
                     trainable_params = self._get_trainable_params()
-                    nuc_norm = self._compute_nuclear_norm(trainable_params)
-                    reg_loss = self.lmbda * nuc_norm
-                    loss = vanilla_loss + reg_loss
+                    # If not using LoRA, apply nuclear norm regularization
+                    if self.rank == 0:
+                        # Only apply nuclear norm to the Q/V weights we are training
+                        nuc_norm = self._compute_nuclear_norm(trainable_params)
+                        reg_loss = self.lmbda * nuc_norm
+                        loss = vanilla_loss + reg_loss
 
-                else:
-                    loss = vanilla_loss
+                    else:
+                        L2_norm = sum((matrix ** 2).sum() for matrix in trainable_params)
+                        reg_loss = self.lmbda * L2_norm/2 
+                        loss = vanilla_loss + reg_loss
 
-                loss.backward()
-                self.optimizer.step()
-                # if self.lr_scheduler is not None:
-                #     self.lr_scheduler.step()
+                scaler.scale(loss).backward()
+                scaler.unscale_(self.optimizer)
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.grad_clip)
+                scaler.step(self.optimizer)
+                scaler.update()
 
                 total_loss += loss.item()
 
@@ -373,9 +408,10 @@ class FineTuningTrainer:
                 if self.project_name is not None:
                     wandb.log({
                         "train/vanilla_loss": vanilla_loss,
-                        "train/reg_loss": reg_loss if self.rank == 0 else None,
+                        "train/reg_loss": reg_loss,
                         "train/loss": loss.item(),
                         "train/learning_rate": current_lr,
+                        "train/grad_norm": grad_norm,
                         "epoch": epoch
                     }, step = self.global_step)
 
@@ -385,27 +421,33 @@ class FineTuningTrainer:
             val_acc = self.evaluate()['accuracy']
 
             # Compute rank(\Delta W) at end of epoch
-            if self.rank == 0:
-                trainable_params = self._get_trainable_params()
-                rank_deltaW = self._compute_rank_of_deltas(trainable_params)
-            else:
-                rank_deltaW = 0
+            trainable_params = self._get_trainable_params()
+            rank_deltaW = self._compute_rank_of_deltas(trainable_params)
+            self.train_loss = total_loss/len(train_loader)
+            if self.lr_scheduler is not None:
+                    self.lr_scheduler.step(self.train_loss)
 
             print(f"Epoch [{epoch+1}/{self.num_epochs}], "
-                  f"Train Loss: {total_loss/len(train_loader):.4f}, "
+                  f"Train Loss: {self.train_loss:.4f}, "
                   f"Val Accuracy: {val_acc:.4f}, "
                   f"Rank(ΔW): {rank_deltaW}")
             
             if self.project_name is not None:
+                if (epoch+1)% 10 ==0:
+                    self.save_model(epoch+1)
+            
+
+            if self.project_name is not None:
                 wandb.log({
+                        "test/total_train_loss": self.train_loss,
                         "test/val_acc": val_acc,
-                        "test/rank": rank_deltaW,
-                        "epoch": epoch
+                        "test/max_rank": max(rank_deltaW),
+                        "epoch": epoch  
                     }, step = self.global_step)
         
         if self.project_name is not None:
             wandb.finish()
-            self.save_model()
+            self.save_model(self.num_epochs)
             
 
     def evaluate(self, test_dataset = None):
