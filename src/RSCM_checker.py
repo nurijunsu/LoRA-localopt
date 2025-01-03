@@ -17,13 +17,13 @@ class RSCM_checker:
                  tuning_weights, 
                  train_dataset,
                  epsilon = 1,
-                 rank=4, 
+                 RSCM_rank=4, 
                  num_samples=1000,):  # Add batch_size parameter
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = pretrained_model.to(self.device)
         self.tuning_weights = tuning_weights
         self.epsilon = epsilon
-        self.rank = rank
+        self.rank = RSCM_rank
         self.num_samples = num_samples
         self.weight_list = self._configure_weights()
         self.train_dataset = train_dataset
@@ -178,12 +178,12 @@ class RSCM_checker:
 
         loss=0.0
         # Compute the loss
-        for batch in tqdm(subset_loader):
+        for batch in tqdm(self.train_loader):
             batch = {k: v.to(self.device) for k, v in batch.items()}
             with autocast():
                 loss += self.model(**batch).loss
 
-        loss= loss / len(subset_loader)
+        loss= loss / len(self.train_loader)
         self.model.zero_grad()
         loss.backward(create_graph = True)
         # Compute the first gradient (grad of loss w.r.t. delta)
@@ -268,10 +268,21 @@ class RSCM_checker:
         return pd.DataFrame(values_dict)
 
 if __name__ == "__main__":
-    torch.cuda.empty_cache()
-    pretrained_model =  Model_Pretrained(model_name='roberta', dataset_name='sst2', fine_tuned=True, rank = 0, tuning_weights= 'one').get_model()
-    pretrained_model.load_state_dict(torch.load('../logs/sst2/tuned=one_LoRA=0/lambda_0.1/lambda_0.1_epoch_100_lr.pth'))
+    model_name = 'roberta'
+    dataset_name = 'sst2'
+    tuning_weights = 'one'
+    RSCM_rank = 4
+
+    # Load the model, pretrained and classifier-trained and fine tuned
+    pretrained_model =  Model_Pretrained(model_name=model_name, dataset_name=dataset_name, fine_tuned=True, rank = 0, tuning_weights= tuning_weights).get_model()
+    pretrained_model.load_state_dict(torch.load(f'../logs/{dataset_name}/tuned=o{tuning_weights}_LoRA=0/lambda_0.1/lambda_0.1_epoch_100_lr.pth'))
+
     train_dataset = CustomDataset(task_name='sst2', split="train")
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights='one', train_dataset=train_dataset,rank=4, num_samples=50)
-    print("hello, world!")
-    print(checker.RSM())
+
+    #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights='one', train_dataset=train_dataset, RSCM_rank=RSCM_rank, num_samples=50)
+    RSC = checker.RSC()
+    RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
+    RSM = checker.RSM()
+    RSM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv', index = False)
+    
