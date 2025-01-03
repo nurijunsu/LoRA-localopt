@@ -22,10 +22,12 @@ print("Datasets Created")
 # check_labels(train_dataset.dataset_split, "Train Dataset")
 # check_labels(test_dataset.dataset_split, "Test Dataset")
 
+tuning_weights = 'one'# one, last, or all
+rank = 768
 if task_name == "cifar100":
-    model_loader = Model_Pretrained("vit",task_name)  
+    model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights)  
 else:
-    model_loader = Model_Pretrained("roberta",task_name)  
+    model_loader = Model_Pretrained("roberta",task_name, fine_tuned=True, rank=rank, tuning_weights=tuning_weights)  
 
 model = model_loader.get_model()
 
@@ -33,17 +35,17 @@ model = model_loader.get_model()
 print("Model Loaded")
 
 project_name=f'global_minimizer_rank_{task_name}'
-tuning_weights = 'one'# one, last, or all
+
 lmbda = 1
 
-for lmbda in [0.1, 0.05, 0.03, 0.01]:
+for lmbda in [0.01, 0.005, 0.001]:
     #Initialize trainer
     trainer= FineTuningTrainer(                                                                                                                                                          
             model = model,
             train_dataset = train_dataset,
             test_dataset= test_dataset,
             tuning_weights= tuning_weights,    
-            rank = 0,
+            rank = rank,
             lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
             local_initialization= True,
             num_epochs = 100,
