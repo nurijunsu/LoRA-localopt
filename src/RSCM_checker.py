@@ -10,6 +10,7 @@ from tqdm import tqdm
 import pandas as pd 
 from collections import defaultdict
 from torch.cuda.amp import autocast, GradScaler
+import gc
 
 class RSCM_checker:
     def __init__(self, 
@@ -166,39 +167,59 @@ class RSCM_checker:
         original_data = lora_layer.delta.data.clone()
         delta.requires_grad_(True)
 
-        subset_dataset = torch.utils.data.Subset(self.train_dataset, range(100))  # Use a subset
-        subset_loader = DataLoader(
-            subset_dataset, 
-            batch_size = self.batch_size,
-            shuffle = False, 
-            collate_fn=self.train_loader.collate_fn
-        )
+        #Run on a subset dataset for fast running and debugging
+        # subset_dataset = torch.utils.data.Subset(self.train_dataset, range(100))  # Use a subset
+        # subset_loader = DataLoader(
+        #     subset_dataset, 
+        #     batch_size = self.batch_size,
+        #     shuffle = False, 
+        #     collate_fn=self.train_loader.collate_fn
+        # )
 
         lora_layer.delta = nn.Parameter(delta.clone(), requires_grad=True)
 
-        loss=0.0
+        
+        hvp_scalar = 0.0
         # Compute the loss
-        for batch in tqdm(self.train_loader):
+        for batch in tqdm(self.train_loader):  
+            loss=0.0          
             batch = {k: v.to(self.device) for k, v in batch.items()}
             with autocast():
-                loss += self.model(**batch).loss
+                loss = self.model(**batch).loss / len(self.train_loader)
 
-        loss= loss / len(self.train_loader)
-        self.model.zero_grad()
-        loss.backward(create_graph = True)
-        # Compute the first gradient (grad of loss w.r.t. delta)
-        with autocast():
-            grad = lora_layer.delta.grad
-        # Compute the dot product of grad and direction
-        grad_dot_direction = torch.dot(grad.view(-1), direction.view(-1))
-        
-        grad_dot_direction.backward()
-        
-        # Compute the second gradient (Hessian-vector product)
-        hessian_vector = lora_layer.delta.grad
-        
-        # Compute the scalar value of direction^T H direction
-        hvp_scalar = torch.dot(hessian_vector.view(-1), direction.view(-1))
+            self.model.zero_grad()
+            loss.backward(create_graph = True)
+            # Compute the first gradient (grad of loss w.r.t. delta)
+            with autocast():
+                grad = lora_layer.delta.grad
+            # Compute the dot product of grad and direction
+            grad_dot_direction = torch.dot(grad.view(-1), direction.view(-1))
+            
+            grad_dot_direction.backward()
+            
+            # Compute the second gradient (Hessian-vector product)
+            hessian_vector = lora_layer.delta.grad
+            
+            # Compute the scalar value of direction^T H direction
+            hvp_scalar += torch.dot(hessian_vector.view(-1), direction.view(-1))
+
+            # Detach gradients to prevent graph retention
+        grad = grad.detach()
+        grad_dot_direction = grad_dot_direction.detach()
+        hessian_vector = hessian_vector.detach()
+
+        # Delete intermediate variables to free memory
+        del loss
+        del grad
+        del grad_dot_direction
+        del hessian_vector
+
+        # Clear gradients of delta for the next iteration
+        lora_layer.delta.grad.zero_()
+
+        # Optionally, clear cache and collect garbage
+        torch.cuda.empty_cache()
+        gc.collect()
 
         lora_layer.delta.data.copy_(original_data)
         
@@ -272,17 +293,19 @@ if __name__ == "__main__":
     dataset_name = 'sst2'
     tuning_weights = 'one'
     RSCM_rank = 4
+    lmbda = 0.01
 
     # Load the model, pretrained and classifier-trained and fine tuned
     pretrained_model =  Model_Pretrained(model_name=model_name, dataset_name=dataset_name, fine_tuned=True, rank = 0, tuning_weights= tuning_weights).get_model()
-    pretrained_model.load_state_dict(torch.load(f'../logs/{dataset_name}/tuned=o{tuning_weights}_LoRA=0/lambda_0.1/lambda_0.1_epoch_100_lr.pth'))
+    pretrained_model.load_state_dict(torch.load(f'../logs/{dataset_name}/tuned={tuning_weights}_LoRA=0/lambda_{lmbda}/lambda_{lmbda}_epoch_100_lr.pth'))
 
     train_dataset = CustomDataset(task_name='sst2', split="train")
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights='one', train_dataset=train_dataset, RSCM_rank=RSCM_rank, num_samples=50)
-    RSC = checker.RSC()
-    RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights='one', train_dataset=train_dataset, RSCM_rank=RSCM_rank, num_samples=1)
+    # RSC = checker.RSC()
+    # RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
+
     RSM = checker.RSM()
     RSM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv', index = False)
     

@@ -19,40 +19,33 @@ for task_name in ['cifar100', 'sst2', 'qnli', 'qqp']:
 
     print("Datasets Created")
 
-    # check_labels(train_dataset.dataset_split, "Train Dataset")
-    # check_labels(test_dataset.dataset_split, "Test Dataset")
+    project_name=f'nonlocal_initialization_{task_name}'
+    tuning_weights = 'last'# one, last, or all
+    rank = 16
+    lmbda = 2e-4
+    local_initialization = False  
 
     if task_name == "cifar100":
-        model_loader = Model_Pretrained("vit",task_name)  
+        model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights, local_init=local_initialization)  
     else:
-        model_loader = Model_Pretrained("roberta",task_name)  
+        model_loader = Model_Pretrained("roberta",task_name, fine_tuned=True, rank=rank, tuning_weights=tuning_weights, local_init = local_initialization)  
 
     model = model_loader.get_model()
 
+    trainer= FineTuningTrainer(                                                                                                                                                          
+            model = model,
+            train_dataset = train_dataset,
+            test_dataset= test_dataset,
+            tuning_weights= tuning_weights,    
+            rank = rank,
+            lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
+            local_initialization= local_initialization,
+            num_epochs = 100,
+            learning_rate= 1e-2,
+            batch_size=128,
+            device = device,
+            project_name=project_name, 
+            log_dir = f'../logs/local_init/{task_name}/tuned={tuning_weights}_LoRA={rank}_lmbda={lmbda}_local={local_initialization}'
+        )
 
-    print("Model Loaded")
-
-    project_name=f'nonlocal_initialization_{task_name}'
-    tuning_weights = 'one'# one, last, or all
-    rank = 16
-
-    lmbda = 2e-3
-
-    for local_initialization in [True, False]:    
-        trainer= FineTuningTrainer(                                                                                                                                                          
-                model = model,
-                train_dataset = train_dataset,
-                test_dataset= test_dataset,
-                tuning_weights= tuning_weights,    
-                rank = rank,
-                lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
-                local_initialization= local_initialization,
-                num_epochs = 100,
-                learning_rate= 5e-3,
-                batch_size=128,
-                device = device,
-                project_name=project_name, 
-                log_dir = f'../logs/local_init/{task_name}/tuned={tuning_weights}_LoRA={rank}_lmbda={lmbda}_local={local_initialization}'
-            )
-
-        trainer.train()
+    trainer.train()

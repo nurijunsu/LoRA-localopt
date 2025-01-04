@@ -4,13 +4,14 @@ from transformers import RobertaForSequenceClassification, ViTForImageClassifica
 from fine_tuner import LoRALayer
 
 class Model_Pretrained:
-    def __init__(self, model_name: str, dataset_name: str, fine_tuned:bool = False, rank:int =0, tuning_weights:str = None):
+    def __init__(self, model_name: str, dataset_name: str, fine_tuned:bool = False, rank:int =0, local_init:bool =True, tuning_weights:str = None):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model_name = model_name.lower()
         self.dataset_name = dataset_name.lower()
         self.valid_roberta_datasets = ['sst2', 'qnli', 'qqp']
         self.model = self._load_and_modify_model()
         self.rank = rank
+        self.local_init = local_init
         self.tuning_weights = tuning_weights
         if fine_tuned:
             print('fine_tuned')
@@ -149,6 +150,7 @@ class Model_Pretrained:
             out_features=out_features,
             r=self.rank,
             lora_alpha=self.rank,
+            local_init= self.local_init,
             bias=(linear_layer.bias is not None)
         )
         # Copy the pretrained weight & bias (LoRA layer's base weight is kept frozen, but we copy it over)

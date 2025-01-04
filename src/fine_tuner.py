@@ -41,13 +41,16 @@ class LoRALayer(nn.Linear):
     def reset_parameters(self):
         nn.Linear.reset_parameters(self) 
         if hasattr(self, 'lora_A'):
+            print(f'self.local_init in reset_parameters is {self.local_init}')
             if self.local_init:
                 # initialize B the same way as the default for nn.Linear and A to zero
                 nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
                 nn.init.zeros_(self.lora_B)
+                print('locally initialized')
             else: 
-                nn.init.kaiming_uniform_(self.lora_A, a = 1000)
-                nn.init.kaiming_uniform_(self.lora_B, a = 1000)
+                nn.init.normal_(self.lora_A, mean=0, std=1)
+                nn.init.normal_(self.lora_B, mean=0, std=1)
+                print('non-locally initialized')
 
     
     def forward(self, x:torch.Tensor):
@@ -100,7 +103,6 @@ class FineTuningTrainer:
         self.tuning_weights = tuning_weights
         self.rank = rank
         self.lmbda = lmbda 
-        self.local_initialization = local_initialization
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
         self.batch_size = batch_size
@@ -330,7 +332,7 @@ class FineTuningTrainer:
                   f"Rank(ΔW): {rank_deltaW}")
             
             if self.project_name is not None:
-                if (epoch+1)% 10 ==0:
+                if (epoch+1)% 50 ==0:
                     self.save_model(epoch+1)
             
 

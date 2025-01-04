@@ -23,7 +23,7 @@ print("Datasets Created")
 # check_labels(test_dataset.dataset_split, "Test Dataset")
 
 tuning_weights = 'one'# one, last, or all
-rank = 768
+rank = 0
 if task_name == "cifar100":
     model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights)  
 else:
@@ -38,7 +38,7 @@ project_name=f'global_minimizer_rank_{task_name}'
 
 lmbda = 1
 
-for lmbda in [0.01, 0.005, 0.001]:
+for lmbda in [5e-4]:
     #Initialize trainer
     trainer= FineTuningTrainer(                                                                                                                                                          
             model = model,
