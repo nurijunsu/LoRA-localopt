@@ -204,22 +204,22 @@ class RSCM_checker:
             hvp_scalar += torch.dot(hessian_vector.view(-1), direction.view(-1))
 
             # Detach gradients to prevent graph retention
-        grad = grad.detach()
-        grad_dot_direction = grad_dot_direction.detach()
-        hessian_vector = hessian_vector.detach()
+            grad = grad.detach()
+            grad_dot_direction = grad_dot_direction.detach()
+            hessian_vector = hessian_vector.detach()
 
-        # Delete intermediate variables to free memory
-        del loss
-        del grad
-        del grad_dot_direction
-        del hessian_vector
+            # Delete intermediate variables to free memory
+            del loss
+            del grad
+            del grad_dot_direction
+            del hessian_vector
 
         # Clear gradients of delta for the next iteration
         lora_layer.delta.grad.zero_()
 
         # Optionally, clear cache and collect garbage
-        torch.cuda.empty_cache()
-        gc.collect()
+        # torch.cuda.empty_cache()
+        # gc.collect()  
 
         lora_layer.delta.data.copy_(original_data)
         
@@ -303,8 +303,8 @@ if __name__ == "__main__":
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
     checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights='one', train_dataset=train_dataset, RSCM_rank=RSCM_rank, num_samples=1)
-    # RSC = checker.RSC()
-    # RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
+    #RSC = checker.RSC()
+    #RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
 
     RSM = checker.RSM()
     RSM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv', index = False)

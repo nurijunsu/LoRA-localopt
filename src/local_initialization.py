@@ -23,7 +23,7 @@ for task_name in ['cifar100', 'sst2', 'qnli', 'qqp']:
     tuning_weights = 'last'# one, last, or all
     rank = 16
     lmbda = 2e-4
-    local_initialization = False  
+    local_initialization = True  
 
     if task_name == "cifar100":
         model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights, local_init=local_initialization)  
@@ -41,7 +41,7 @@ for task_name in ['cifar100', 'sst2', 'qnli', 'qqp']:
             lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
             local_initialization= local_initialization,
             num_epochs = 100,
-            learning_rate= 1e-2,
+            learning_rate= 5e-2,
             batch_size=128,
             device = device,
             project_name=project_name, 
