@@ -89,7 +89,8 @@ class FineTuningTrainer:
         grad_clip: float = 10.0,
         device: str = "cuda",
         project_name: str = None,
-        log_dir : str = None
+        log_dir : str = None, 
+        optimizer: str = "SGD"  #SGD  #Adam
     ):
         """
         Args:
@@ -119,20 +120,21 @@ class FineTuningTrainer:
         # 1. Unfreeze or transform the relevant layers
         self.model = self.model.to(device)
         # 2. Build optimizer (and optionally a scheduler)
-        if self.rank > 0:
+        if optimizer == "SGD":
             self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.9)
-        else:
-            self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum=0.9)
-        if "nonlocal_initialization" in self.project_name:
-            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, threshold = 0.002, patience=5, min_lr =1e-7)
-        else:
-            #self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
-            # self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            #                         self.optimizer,
-            #                         T_0=20,  # Number of epochs for the first restart
-            #                         eta_min=1e-8  # Minimum learning rate at the end of each cycle
+        elif optimizer =="Adam":
+            self.optimizer = Adam(self._get_trainable_params(), lr=self.learning_rate)
+
+        # if "nonlocal_initialization" in self.project_name:
+        #     self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, threshold = 0.002, patience=5, min_lr =1e-7)
+        # else:
+        #     #self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
+        #     # self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        #     #                         self.optimizer,
+        #     #                         T_0=20,  # Number of epochs for the first restart
+        #     #                         eta_min=1e-8  # Minimum learning rate at the end of each cycle
             #                     )
-            self.lr_scheduler = None
+        self.lr_scheduler = None
             
         self.train_loss = 0
 
@@ -214,14 +216,15 @@ class FineTuningTrainer:
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
                 # Compute rank based on the threshold
-                threshold = 1e-5
+                threshold = 1e-3 * torch.norm(mat, p='fro')
                 rank.append(torch.sum(S > threshold).item())
-                indices = (S > threshold).nonzero(as_tuple=True)[0]
-                smallest_index = indices[-1].item()
-                start = max(0, smallest_index - 2)
-                end = min(len(S), smallest_index +2)
-                nearby_singular_values = S[start:end]
-                print(f"Singular values around the threshold at index {smallest_index}: {nearby_singular_values}")
+                #print(S)
+                # indices = (S > threshold).nonzero(as_tuple=True)[0]
+                # smallest_index = indices[-1].item()
+                # start = max(0, smallest_index - 2)
+                # end = min(len(S), smallest_index +2)
+                # nearby_singular_values = S[start:end]
+                # print(f"Singular values around the threshold at index {smallest_index}: {nearby_singular_values}")
         else:
             for i in range(0, len(params_list), 2):
                 A = params_list[i]     # Get A matrix
@@ -229,7 +232,7 @@ class FineTuningTrainer:
                 mat = B @ A  # Compute the matrix product
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
-                threshold = S[0]*1e-3
+                threshold = 1e-3 * torch.norm(mat, p='fro')
 
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())

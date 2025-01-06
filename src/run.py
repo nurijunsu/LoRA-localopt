@@ -51,25 +51,22 @@ print("Model Loaded")
 project_name=f'global_minimizer_rank_{task_name}'
 
 
+trainer= FineTuningTrainer(                                                                                                                                                          
+        model = model,
+        train_dataset = train_dataset,
+        test_dataset= test_dataset,
+        tuning_weights= tuning_weights,    
+        rank = rank,
+        lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
+        local_initialization= True,
+        num_epochs = 120,
+        learning_rate= 5e-3,
+        batch_size=128,
+        device = device,
+        project_name=project_name
+    )
 
-for lmbda in [5e-4]:
-    #Initialize trainer
-    trainer= FineTuningTrainer(                                                                                                                                                          
-            model = model,
-            train_dataset = train_dataset,
-            test_dataset= test_dataset,
-            tuning_weights= tuning_weights,    
-            rank = rank,
-            lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
-            local_initialization= True,
-            num_epochs = 120,
-            learning_rate= 5e-3,
-            batch_size=128,
-            device = device,
-            project_name=project_name
-        )
-
-    trainer.train()
+trainer.train()
 
 # Evaluate
 print("Evaluating...")
