@@ -4,13 +4,27 @@ from fine_tuner import FineTuningTrainer
 import torch
 from torch.utils.data import DataLoader
 from transformers import RobertaForSequenceClassification, ViTForImageClassification
+import argparse
+
+
+def parse_args():
+    parse = argparse.ArgumentParser()
+    parse.add_argument('--task_name', type=str, help='fine tuning task')
+    parse.add_argument('--lmbda', type=float, help='weight decay parameter')
+    parse.add_argument('--tuning_weights', type=str, help='finetuning type')
+    args = parse.parse_args()
+    return args
+
+args = parse_args()
+task_name = args.task_name
+# ["sst2", "qnli", "qqp", "cifar100", "superb_ic"]
+lmbda = args.lmbda
+# [0.1, 0.01 0.001, 0.0001]
+tuning_weights = args.tuning_weights
+# [one, last, all]
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
-
-# Choose a task
-task_name = 'sst2' # e.g., "sst2", "qnli", "qqp", "cifar100", "superb_ic"
-
 
 # Create custom datasets
 train_dataset = CustomDataset(task_name=task_name, split="train")
@@ -22,7 +36,7 @@ print("Datasets Created")
 # check_labels(train_dataset.dataset_split, "Train Dataset")
 # check_labels(test_dataset.dataset_split, "Test Dataset")
 
-tuning_weights = 'one'# one, last, or all
+
 rank = 0
 if task_name == "cifar100":
     model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights)  
@@ -36,7 +50,7 @@ print("Model Loaded")
 
 project_name=f'global_minimizer_rank_{task_name}'
 
-lmbda = 1
+
 
 for lmbda in [5e-4]:
     #Initialize trainer
