@@ -302,9 +302,9 @@ if __name__ == "__main__":
     train_dataset = CustomDataset(task_name='sst2', split="train")
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights='one', train_dataset=train_dataset, RSCM_rank=RSCM_rank, num_samples=1)
-    #RSC = checker.RSC()
-    #RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights='one', train_dataset=train_dataset, epsilon =1, RSCM_rank=RSCM_rank, num_samples=1000)
+    RSC = checker.RSC()
+    RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
 
     RSM = checker.RSM()
     RSM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv', index = False)

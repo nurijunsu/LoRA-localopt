@@ -113,8 +113,6 @@ class Model_Pretrained:
             elif hasattr(attn_module, "self"):  # For RoBERTa
                 submodule = attn_module.self
 
-            print(submodule)
-
             if hasattr(submodule, "query") and hasattr(submodule, "value"):  # Roberta, vit
                 q_name = "query"    
                 v_name = "value"

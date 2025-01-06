@@ -41,7 +41,6 @@ class LoRALayer(nn.Linear):
     def reset_parameters(self):
         nn.Linear.reset_parameters(self) 
         if hasattr(self, 'lora_A'):
-            print(f'self.local_init in reset_parameters is {self.local_init}')
             if self.local_init:
                 # initialize B the same way as the default for nn.Linear and A to zero
                 nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -50,6 +49,13 @@ class LoRALayer(nn.Linear):
             else: 
                 nn.init.normal_(self.lora_A, mean=0, std=1)
                 nn.init.normal_(self.lora_B, mean=0, std=1)
+                
+                prod = self.lora_B.data @ self.lora_A.data
+                _, S, _ = torch.linalg.svd(prod)
+                scaling = torch.sqrt(50.0/(S[self.r-1]+1e-5))
+
+                self.lora_A.data *= scaling
+                self.lora_B.data *= scaling
                 print('non-locally initialized')
 
     
@@ -72,14 +78,14 @@ class FineTuningTrainer:
         self,
         train_dataset,
         test_dataset,
-        model: nn.Module,
+        model: nn.Module, 
         tuning_weights: str = "last",    # one, last, or all
         rank: int = 4,
         lmbda: float = 0.01,            # Weight decay OR nuclear-norm coefficient
         local_initialization: bool = True,
-        num_epochs: int = 3,
+        num_epochs: int = 100,
         learning_rate: float = 5e-3,
-        batch_size:int = 32,
+        batch_size:int = 128,
         grad_clip: float = 10.0,
         device: str = "cuda",
         project_name: str = None,
@@ -117,7 +123,17 @@ class FineTuningTrainer:
             self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.9)
         else:
             self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum=0.9)
-        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
+        if "nonlocal_initialization" in self.project_name:
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, threshold = 0.002, patience=5, min_lr =1e-7)
+        else:
+            #self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
+            # self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            #                         self.optimizer,
+            #                         T_0=20,  # Number of epochs for the first restart
+            #                         eta_min=1e-8  # Minimum learning rate at the end of each cycle
+            #                     )
+            self.lr_scheduler = None
+            
         self.train_loss = 0
 
         # Wandb logging
@@ -188,6 +204,7 @@ class FineTuningTrainer:
         # For demonstration, let's sum rank across all trainable params.
         # The rank is the number of singular values above a threshold, e.g. 1e-5.
         rank = []
+        sigma_r = []
         if self.rank == 0:
             for param in params_list:
                 if param.ndim < 2:
@@ -197,7 +214,7 @@ class FineTuningTrainer:
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
                 # Compute rank based on the threshold
-                threshold = 1e-3 * S[0]
+                threshold = 1e-5
                 rank.append(torch.sum(S > threshold).item())
                 indices = (S > threshold).nonzero(as_tuple=True)[0]
                 smallest_index = indices[-1].item()
@@ -210,23 +227,15 @@ class FineTuningTrainer:
                 A = params_list[i]     # Get A matrix
                 B = params_list[i+1]   # Get B matrix
                 mat = B @ A  # Compute the matrix product
-                print(mat)
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
-                threshold = 1e-3 * S[0]
-                print(S[0])
+                threshold = S[0]*1e-3
+
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())
+                sigma_r.append(S[self.rank-1])
 
-                indices = (S > threshold).nonzero(as_tuple=True)[0]
-                print(indices)
-                smallest_index = indices[-1].item()
-                start = max(0, smallest_index - 2)
-                end = min(len(S), smallest_index +2)
-                nearby_singular_values = S[start:end]
-                print(f"Singular values around the threshold at index {smallest_index}: {nearby_singular_values}")
-
-        return rank
+        return sigma_r, rank
 
     
     
@@ -321,11 +330,15 @@ class FineTuningTrainer:
 
             # Compute rank(\Delta W) at end of epoch
             trainable_params = self._get_trainable_params()
-            rank_deltaW = self._compute_rank_of_deltas(trainable_params)
+            sigma_r , rank_deltaW = self._compute_rank_of_deltas(trainable_params)
             self.train_loss = total_loss/len(train_loader)
             if self.lr_scheduler is not None:
+                # self.lr_scheduler.step(self.train_loss) for stepLR
+                if "nonlocal_initialization" in self.project_name:
                     self.lr_scheduler.step(self.train_loss)
-
+                else:
+                    self.lr_scheduler.step()
+            
             print(f"Epoch [{epoch+1}/{self.num_epochs}], "
                   f"Train Loss: {self.train_loss:.4f}, "
                   f"Val Accuracy: {val_acc:.4f}, "
@@ -334,13 +347,12 @@ class FineTuningTrainer:
             if self.project_name is not None:
                 if (epoch+1)% 50 ==0:
                     self.save_model(epoch+1)
-            
 
-            if self.project_name is not None:
                 wandb.log({
                         "test/total_train_loss": self.train_loss,
                         "test/val_acc": val_acc,
                         "test/max_rank": max(rank_deltaW),
+                        "test/max_sigma_r": max(sigma_r),
                         "epoch": epoch  
                     }, step = self.global_step)
         

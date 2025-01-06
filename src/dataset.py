@@ -1,14 +1,16 @@
 import os
 import shutil
 from datasets import load_dataset, DatasetDict, load_from_disk
+import torch, torchvision
+from torchvision import transforms
+torchvision.disable_beta_transforms_warning()
+import numpy as np
 from transformers import (
     AutoTokenizer,
     AutoImageProcessor,
     AutoProcessor
 )
-import torch
-from torchvision import transforms
-import numpy as np
+
 
 class CustomDataset(torch.utils.data.Dataset):
     """
