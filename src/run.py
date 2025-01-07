@@ -18,13 +18,10 @@ def parse_args():
 args = parse_args()
 task_name = args.task_name
 # ["sst2", "qnli", "qqp", "cifar100", "superb_ic"]
-print(type(task_name))
 lmbda = args.lmbda
 # [0.1, 0.01 0.001, 0.0001]
-print(type(lmbda))
 tuning_weights = args.tuning_weights
 # [one, last, all]
-print(type(tuning_weights))
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -62,8 +59,8 @@ trainer= FineTuningTrainer(
         rank = rank,
         lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
         local_initialization= True,
-        num_epochs = 120,
-        learning_rate= 5e-3,
+        num_epochs = 200,
+        learning_rate= 1e-3,
         batch_size=128,
         device = device,
         optimizer = "SGD",

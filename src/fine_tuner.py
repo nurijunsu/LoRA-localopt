@@ -213,6 +213,7 @@ class FineTuningTrainer:
         # The rank is the number of singular values above a threshold, e.g. 1e-5.
         rank = []
         sigma_r = []
+        sigma_r_plus_one = []
         if self.rank == 0:
             for param in params_list:
                 if param.ndim < 2:
@@ -224,13 +225,8 @@ class FineTuningTrainer:
                 # Compute rank based on the threshold
                 threshold = 1e-3 * torch.norm(mat, p='fro')
                 rank.append(torch.sum(S > threshold).item())
-                #print(S)
-                # indices = (S > threshold).nonzero(as_tuple=True)[0]
-                # smallest_index = indices[-1].item()
-                # start = max(0, smallest_index - 2)
-                # end = min(len(S), smallest_index +2)
-                # nearby_singular_values = S[start:end]
-                # print(f"Singular values around the threshold at index {smallest_index}: {nearby_singular_values}")
+                sigma_r.append(S[rank[-1]-1])
+                sigma_r_plus_one.append(S[rank[-1]])
         else:
             for i in range(0, len(params_list), 2):
                 A = params_list[i]     # Get A matrix
@@ -242,7 +238,8 @@ class FineTuningTrainer:
 
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())
-                sigma_r.append(S[self.rank-1])
+                sigma_r.append(S[rank[-1]-1])
+                sigma_r_plus_one.append(S[rank[-1]])
 
         return sigma_r, rank
 
@@ -339,7 +336,7 @@ class FineTuningTrainer:
 
             # Compute rank(\Delta W) at end of epoch
             trainable_params = self._get_trainable_params()
-            sigma_r , rank_deltaW = self._compute_rank_of_deltas(trainable_params)
+            sigma_r , sigma_r_plus_one, rank_deltaW = self._compute_rank_of_deltas(trainable_params)
             self.train_loss = total_loss/len(train_loader)
             if self.lr_scheduler is not None:
                 # self.lr_scheduler.step(self.train_loss) for stepLR
@@ -360,8 +357,9 @@ class FineTuningTrainer:
                 wandb.log({
                         "test/total_train_loss": self.train_loss,
                         "test/val_acc": val_acc,
-                        "test/max_rank": max(rank_deltaW),
-                        "test/max_sigma_r": max(sigma_r),
+                        **{f"test/rank_{i}": rank_deltaW[i] for i in range(len(rank_deltaW))}, 
+                        **{f"test/sigma_r_{i}": sigma_r[i] for i in range(len(sigma_r))}, 
+                        **{f"test/sigma_r+1_{i}": sigma_r_plus_one[i] for i in range(len(sigma_r_plus_one))}, 
                         "epoch": epoch  
                     }, step = self.global_step)
         

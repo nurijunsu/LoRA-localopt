@@ -14,7 +14,6 @@ class Model_Pretrained:
         self.local_init = local_init
         self.tuning_weights = tuning_weights
         if fine_tuned:
-            print('fine_tuned')
             self._configure_layers()
         
         
