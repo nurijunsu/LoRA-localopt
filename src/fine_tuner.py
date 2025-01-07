@@ -137,7 +137,7 @@ class FineTuningTrainer:
             #                     )
         self.lr_scheduler = get_scheduler(
                                             name="cosine",
-                                            optimizer=optimizer,
+                                            optimizer=self.optimizer,
                                             num_warmup_steps= 5000,
                                             num_training_steps= 100000
                                         )   
