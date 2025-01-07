@@ -5,6 +5,7 @@ import math
 from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader
 import transformers
+from transformers import get_scheduler
 from tqdm import tqdm
 import os
 import wandb
@@ -134,8 +135,13 @@ class FineTuningTrainer:
         #     #                         T_0=20,  # Number of epochs for the first restart
         #     #                         eta_min=1e-8  # Minimum learning rate at the end of each cycle
             #                     )
-        self.lr_scheduler = None
-            
+        self.lr_scheduler = get_scheduler(
+                                            name="cosine",
+                                            optimizer=optimizer,
+                                            num_warmup_steps= 5000,
+                                            num_training_steps= 100000
+                                        )   
+                                                    
         self.train_loss = 0
 
         # Wandb logging
