@@ -138,8 +138,8 @@ class FineTuningTrainer:
         self.lr_scheduler = get_scheduler(
                                             name="cosine",
                                             optimizer=self.optimizer,
-                                            num_warmup_steps= 5000,
-                                            num_training_steps= 100000
+                                            num_warmup_steps= round(0.05 * self.num_epochs),
+                                            num_training_steps= self.num_epochs
                                         )   
                                                     
         self.train_loss = 0
@@ -241,7 +241,7 @@ class FineTuningTrainer:
                 sigma_r.append(S[rank[-1]-1])
                 sigma_r_plus_one.append(S[rank[-1]])
 
-        return sigma_r, rank
+        return sigma_r, sigma_r_plus_one, rank
 
     
     
