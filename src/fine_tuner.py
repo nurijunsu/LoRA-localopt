@@ -81,7 +81,7 @@ class FineTuningTrainer:
         test_dataset,
         model: nn.Module, 
         tuning_weights: str = "last",    # one, last, or all
-        rank: int = 4,
+        rank: int = 4,                  # full fine tuning if rank=0
         lmbda: float = 0.01,            # Weight decay OR nuclear-norm coefficient
         local_initialization: bool = True,
         num_epochs: int = 100,
@@ -89,9 +89,10 @@ class FineTuningTrainer:
         batch_size:int = 128,
         grad_clip: float = 10.0,
         device: str = "cuda",
-        project_name: str = None,
+        project_name: str = None, 
         log_dir : str = None, 
-        optimizer: str = "SGD"  #SGD  #Adam
+        optimizer: str = "SGD",  #SGD  #Adam
+        proximal_gradient: bool = True #Only for full fine tuning (rank=0)
     ):
         """
         Args:
@@ -116,7 +117,8 @@ class FineTuningTrainer:
         self.batch_size = batch_size
         self.grad_clip = grad_clip
         self.device = device
-        self.project_name = project_name                                                                
+        self.project_name = project_name
+        self.proximal_gradient = proximal_gradient                                                                
 
         # 1. Unfreeze or transform the relevant layers
         self.model = self.model.to(device)
@@ -300,14 +302,15 @@ class FineTuningTrainer:
                     # If not using LoRA, apply nuclear norm regularization
                     if self.rank == 0:
                         # Only apply nuclear norm to the Q/V weights we are training
-                        nuc_norm = self._compute_nuclear_norm(trainable_params)
-                        reg_loss = self.lmbda * nuc_norm
-                        loss = vanilla_loss + reg_loss
-
+                        if self.proximal_gradient:
+                            reg_loss = 0
+                        else:
+                            nuc_norm = self._compute_nuclear_norm(trainable_params)
+                            reg_loss = self.lmbda * nuc_norm                        
                     else:
                         L2_norm = sum((matrix ** 2).sum() for matrix in trainable_params)
                         reg_loss = self.lmbda * L2_norm/2 
-                        loss = vanilla_loss + reg_loss
+                    loss = vanilla_loss + reg_loss
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(self.optimizer)
@@ -315,6 +318,12 @@ class FineTuningTrainer:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.grad_clip)
                 scaler.step(self.optimizer)
                 scaler.update()
+                if self.proximal_gradient:
+                    for name, param in self.model.named_parameters():
+                        if "delta" in name and self.lmbda >= 1e-8: #Skip this if there is no weight decay (weight decay = 0)
+                            u,s,v = torch.linalg.svd(param)
+                            s = torch.nn.Threshold(0, 0)(s-  self.learning_rate * self.lmbda)  #Soft-thresholding operator 
+                            param = (u @ s) @ v
 
                 total_loss += loss.item()
 
