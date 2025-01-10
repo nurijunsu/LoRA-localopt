@@ -11,6 +11,7 @@ import os
 import wandb
 import json
 from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import LambdaLR
 
 class LoRALayer(nn.Linear):
     #LoRA implementation for a linear layer
@@ -90,9 +91,11 @@ class FineTuningTrainer:
         grad_clip: float = 10.0,
         device: str = "cuda",
         project_name: str = None, 
+        run_name: str = None,
         log_dir : str = None, 
         optimizer: str = "SGD",  #SGD  #Adam
-        proximal_gradient: bool = True #Only for full fine tuning (rank=0)
+        lr_scheduler: str = None, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
+        proximal_gradient: bool = False # Only for full fine tuning (rank=0)
     ):
         """
         Args:
@@ -124,30 +127,38 @@ class FineTuningTrainer:
         self.model = self.model.to(device)
         # 2. Build optimizer (and optionally a scheduler)
         if optimizer == "SGD":
-            self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.9)
+            self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.0 if (proximal_gradient or self.rank>0) else 0.9)
         elif optimizer =="Adam":
             self.optimizer = Adam(self._get_trainable_params(), lr=self.learning_rate)
 
-        # if "nonlocal_initialization" in self.project_name:
-        #     self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, threshold = 0.002, patience=5, min_lr =1e-7)
-        # else:
-        #     #self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
-        #     # self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        #     #                         self.optimizer,
-        #     #                         T_0=20,  # Number of epochs for the first restart
-        #     #                         eta_min=1e-8  # Minimum learning rate at the end of each cycle
-            #                     )
-        self.lr_scheduler = get_scheduler(
-                                            name="cosine",
-                                            optimizer=self.optimizer,
-                                            num_warmup_steps= round(0.05 * self.num_epochs),
-                                            num_training_steps= self.num_epochs
-                                        )   
-                                                    
+        if lr_scheduler == "ReduceLROnPlateu":
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
+        elif lr_scheduler == "CosineAnnealing":
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                                    self.optimizer,
+                                    T_0=20,  # Number of epochs for the first restart
+                                    T_mult = 2, #  A factor by which T_i increases after a restart
+                                    eta_min=1e-8,  # Minimum learning rate at the end of each cycle
+                                )
+        elif lr_scheduler == "CosineDecay":
+            self.lr_scheduler = get_scheduler(
+                                        name="cosine",
+                                        optimizer=self.optimizer,
+                                        num_warmup_steps= round(0.05 * self.num_epochs),
+                                        num_training_steps= self.num_epochs
+                                    )   
+        elif lr_scheduler == "LinearWarmup":
+            warmup_steps = 0.05 * self.num_epochs
+            self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / warmup_steps))
+        else:
+            self.lr_scheduler = None
+                                                   
         self.train_loss = 0
 
         # Wandb logging
         self.project_name = project_name
+        if run_name is None: 
+            run_name = f'tuned={self.tuning_weights}_LoRA={self.rank}_lambda={self.lmbda}'
         self.global_step = 0                                                       
         if log_dir is not None:
             self.log_dir = log_dir
@@ -162,17 +173,19 @@ class FineTuningTrainer:
             'lr' : learning_rate,
             'batch_size' : batch_size,
             'epochs' : num_epochs,
-            'optimizer' : self.optimizer.__class__.__name__
+            'optimizer' : self.optimizer.__class__.__name__,
+            'scheduler' : lr_scheduler,
+            'proximal_gradient' : self.proximal_gradient
         }
         self.save_config()
         if project_name is not None:
-            wandb.init(project=project_name, config=self.config, name=f'tuned={self.tuning_weights}_LoRA={self.rank}_lambda={self.lmbda}')
+            wandb.init(project=project_name, config=self.config, name=run_name)
 
     def save_config(self):
         os.makedirs(f"{self.log_dir}", exist_ok=True)
         config_path = os.path.join(f"{self.log_dir}", 'config.json')
         with open(config_path, 'w') as json_file:
-            json.dump(self.config, json_file, indent=4)
+            json.dump(self.config, json_file,   indent=4)
 
     def save_model(self, epochs):
         save_path = f"{self.log_dir}/lambda_{self.lmbda}_epoch_{epochs}_lr.pth"
@@ -201,7 +214,7 @@ class FineTuningTrainer:
             mat = param.view(param.shape[0], -1)
             # Avoid computing large SVD on huge dims if not needed, 
             # but let's do it for demonstration
-            _, S, _ = torch.svd(mat)  # or torch.linalg.svd in newer PyTorch
+            _, S, _ = torch.linalg.svd(mat, full_matrices= False)  # or torch.linalg.svd in newer PyTorch
             nuc_norm = S.sum()
             total_nuc_norm += nuc_norm
         return total_nuc_norm
@@ -225,7 +238,7 @@ class FineTuningTrainer:
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
                 # Compute rank based on the threshold
-                threshold = 1e-3 * torch.norm(mat, p='fro')
+                threshold = 1e-4 * torch.norm(mat, p='fro')
                 rank.append(torch.sum(S > threshold).item())
                 sigma_r.append(S[rank[-1]-1])
                 sigma_r_plus_one.append(S[rank[-1]])
@@ -236,7 +249,7 @@ class FineTuningTrainer:
                 mat = B @ A  # Compute the matrix product
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
-                threshold = 1e-3 * torch.norm(mat, p='fro')
+                threshold = 1e-4 * torch.norm(mat, p='fro')
 
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())
@@ -303,6 +316,7 @@ class FineTuningTrainer:
                     if self.rank == 0:
                         # Only apply nuclear norm to the Q/V weights we are training
                         if self.proximal_gradient:
+                            nuc_norm = 0
                             reg_loss = 0
                         else:
                             nuc_norm = self._compute_nuclear_norm(trainable_params)
@@ -318,22 +332,28 @@ class FineTuningTrainer:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.grad_clip)
                 scaler.step(self.optimizer)
                 scaler.update()
+                learning_rate = self.optimizer.param_groups[0]['lr']
                 if self.proximal_gradient:
-                    for name, param in self.model.named_parameters():
-                        if "delta" in name and self.lmbda >= 1e-8: #Skip this if there is no weight decay (weight decay = 0)
-                            u,s,v = torch.linalg.svd(param)
-                            s = torch.nn.Threshold(0, 0)(s-  self.learning_rate * self.lmbda)  #Soft-thresholding operator 
-                            param = (u @ s) @ v
-
+                    for i, (name, param) in enumerate(self.model.named_parameters()):
+                        if "delta" in name and self.lmbda >= 1e-8: #Skip this if there is no weight decay (lmbda= 0)                       
+                            with torch.no_grad():
+                                u,s,v = torch.linalg.svd(param, full_matrices= False)
+                                s = torch.nn.Threshold(0, 0)(s- learning_rate * self.lmbda)  #Soft-thresholding operator 
+                                param.data = (u @ torch.diag(s)) @ v
+                                nuc_norm += s.sum()
+                                if self.project_name is not None:
+                                    wandb.log({
+                                        f"train/rank_{i}": torch.sum(s> 1e-8).item()
+                                    }, step = self.global_step)   
+                        
                 total_loss += loss.item()
 
-                current_lr = self.optimizer.param_groups[0]['lr']
                 if self.project_name is not None:
                     wandb.log({
                         "train/vanilla_loss": vanilla_loss,
-                        "train/reg_loss": reg_loss,
+                        "train/nuc_norm": nuc_norm if self.rank ==0 else L2_norm/2,
                         "train/loss": loss.item(),
-                        "train/learning_rate": current_lr,
+                        "train/learning_rate": learning_rate,
                         "train/grad_norm": grad_norm,
                         "epoch": epoch
                     }, step = self.global_step)
@@ -348,11 +368,10 @@ class FineTuningTrainer:
             sigma_r , sigma_r_plus_one, rank_deltaW = self._compute_rank_of_deltas(trainable_params)
             self.train_loss = total_loss/len(train_loader)
             if self.lr_scheduler is not None:
-                # self.lr_scheduler.step(self.train_loss) for stepLR
-                if "nonlocal_initialization" in self.project_name:
-                    self.lr_scheduler.step(self.train_loss)
+                if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.lr_scheduler.step(self.train_loss)  # Pass train_loss for ReduceLROnPlateau
                 else:
-                    self.lr_scheduler.step()
+                    self.lr_scheduler.step()  # Call step() for other schedulers
             
             print(f"Epoch [{epoch+1}/{self.num_epochs}], "
                   f"Train Loss: {self.train_loss:.4f}, "

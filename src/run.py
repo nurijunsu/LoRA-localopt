@@ -12,8 +12,11 @@ def parse_args():
     parse.add_argument('--task_name', type=str, help='fine tuning task')
     parse.add_argument('--lmbda', type=float, help='weight decay parameter')
     parse.add_argument('--tuning_weights', type=str, help='finetuning type')
+    parse.add_argument('--learning_rate', type=float, help ='learning rate')
     args = parse.parse_args()
     return args
+
+#python run.py --task_name sst2 --lmbda 0.01 --tuning_weights last --learning_rate 0.01
 
 args = parse_args()
 task_name = args.task_name
@@ -22,6 +25,7 @@ lmbda = args.lmbda
 # [0.1, 0.01 0.001, 0.0001]
 tuning_weights = args.tuning_weights
 # [one, last, all]
+learning_rate = args.learning_rate
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -48,7 +52,7 @@ model = model_loader.get_model()
 
 print("Model Loaded")
 
-project_name=f'global_minimizer_rank_{task_name}'
+project_name=f'Low rank solution_{task_name}'
 
 
 trainer= FineTuningTrainer(                                                                                                                                                          
@@ -60,11 +64,14 @@ trainer= FineTuningTrainer(
         lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
         local_initialization= True,
         num_epochs = 200,
-        learning_rate= 1e-3,
+        learning_rate= learning_rate,
         batch_size=128,
         device = device,
-        optimizer = "SGD",
-        project_name=project_name
+        optimizer = "Adam",
+        proximal_gradient= False,
+        project_name=project_name,
+        lr_scheduler= None, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
+        run_name = f"Adam_last"
     )
 
 trainer.train()
