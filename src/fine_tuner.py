@@ -238,7 +238,7 @@ class FineTuningTrainer:
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
                 # Compute rank based on the threshold
-                threshold = 1e-4 * torch.norm(mat, p='fro')
+                threshold = max(5e-5, 1e-3 * S[0])
                 rank.append(torch.sum(S > threshold).item())
                 sigma_r.append(S[rank[-1]-1])
                 sigma_r_plus_one.append(S[rank[-1]])
@@ -249,7 +249,7 @@ class FineTuningTrainer:
                 mat = B @ A  # Compute the matrix product
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
-                threshold = 1e-4 * torch.norm(mat, p='fro')
+                threshold = max(5e-5, 1e-3 * S[0])
 
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())
@@ -316,7 +316,6 @@ class FineTuningTrainer:
                     if self.rank == 0:
                         # Only apply nuclear norm to the Q/V weights we are training
                         if self.proximal_gradient:
-                            nuc_norm = 0
                             reg_loss = 0
                         else:
                             nuc_norm = self._compute_nuclear_norm(trainable_params)
@@ -334,6 +333,7 @@ class FineTuningTrainer:
                 scaler.update()
                 learning_rate = self.optimizer.param_groups[0]['lr']
                 if self.proximal_gradient:
+                    nuc_norm = 0
                     for i, (name, param) in enumerate(self.model.named_parameters()):
                         if "delta" in name and self.lmbda >= 1e-8: #Skip this if there is no weight decay (lmbda= 0)                       
                             with torch.no_grad():
@@ -345,7 +345,6 @@ class FineTuningTrainer:
                                     wandb.log({
                                         f"train/rank_{i}": torch.sum(s> 1e-8).item()
                                     }, step = self.global_step)   
-                        
                 total_loss += loss.item()
 
                 if self.project_name is not None:

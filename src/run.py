@@ -16,7 +16,7 @@ def parse_args():
     args = parse.parse_args()
     return args
 
-#python run.py --task_name sst2 --lmbda 0.01 --tuning_weights last --learning_rate 0.01
+#python run.py --task_name sst2 --lmbda 0.01 --tuning_weights all --learning_rate 0.01
 
 args = parse_args()
 task_name = args.task_name
@@ -63,15 +63,15 @@ trainer= FineTuningTrainer(
         rank = rank,
         lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
         local_initialization= True,
-        num_epochs = 200,
+        num_epochs = 300,
         learning_rate= learning_rate,
         batch_size=128,
         device = device,
-        optimizer = "Adam",
-        proximal_gradient= False,
+        optimizer = "SGD",
+        proximal_gradient= True,
         project_name=project_name,
-        lr_scheduler= None, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
-        run_name = f"Adam_last"
+        lr_scheduler= "CosineAnnealing", #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
+        run_name = f"all_prox_0.05"
     )
 
 trainer.train()
