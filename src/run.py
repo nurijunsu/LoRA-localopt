@@ -63,7 +63,7 @@ trainer= FineTuningTrainer(
         rank = rank,
         lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
         local_initialization= True,
-        num_epochs = 300,
+        num_epochs = 140,
         learning_rate= learning_rate,
         batch_size=128,
         device = device,
@@ -71,7 +71,7 @@ trainer= FineTuningTrainer(
         proximal_gradient= True,
         project_name=project_name,
         lr_scheduler= "CosineAnnealing", #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
-        run_name = f"all_prox_0.05"
+        run_name = f"all_prox_{lmbda}"
     )
 
 trainer.train()
