@@ -70,7 +70,7 @@ trainer= FineTuningTrainer(
         optimizer = "SGD",
         proximal_gradient= True,
         project_name=project_name,
-        lr_scheduler= "CosineAnnealing", #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
+        lr_scheduler= None, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
         run_name = f"all_prox_{lmbda}"
     )
 
