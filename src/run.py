@@ -13,10 +13,13 @@ def parse_args():
     parse.add_argument('--lmbda', type=float, help='weight decay parameter')
     parse.add_argument('--tuning_weights', type=str, help='finetuning type')
     parse.add_argument('--learning_rate', type=float, help ='learning rate')
+    parse.add_argument('--rank', type=int, help ='rank')
+    parse.add_argument('--local_init', type=bool, help ='local initialization')
+    parse.add_argument('--Scheduler', type=str, help ='Learning Rate Scheduler')
     args = parse.parse_args()
     return args
 
-#python run.py --task_name sst2 --lmbda 0.01 --tuning_weights all --learning_rate 0.01
+#python run.py --task_name sst2 --lmbda 0.01 --tuning_weights all --learning_rate 0.01 --rank 16 --local_init True --Scheduler CosineAnnealing
 
 args = parse_args()
 task_name = args.task_name
@@ -26,6 +29,9 @@ lmbda = args.lmbda
 tuning_weights = args.tuning_weights
 # [one, last, all]
 learning_rate = args.learning_rate
+rank = args.rank
+local_init = args.local_init
+Scheduler = args.Scheduler
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -41,18 +47,17 @@ print("Datasets Created")
 # check_labels(test_dataset.dataset_split, "Test Dataset")
 
 
-rank = 0
 if task_name == "cifar100":
-    model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights)  
+    model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights, local_init=local_init)  
 else:
-    model_loader = Model_Pretrained("roberta",task_name, fine_tuned=True, rank=rank, tuning_weights=tuning_weights)  
+    model_loader = Model_Pretrained("roberta",task_name, fine_tuned=True, rank=rank, tuning_weights=tuning_weights, local_init = local_init)  
 
 model = model_loader.get_model()
 
 
 print("Model Loaded")
 
-project_name=f'Low rank solution_{task_name}'
+project_name=f'Intruder local min_{task_name}'
 
 
 trainer= FineTuningTrainer(                                                                                                                                                          
@@ -62,16 +67,17 @@ trainer= FineTuningTrainer(
         tuning_weights= tuning_weights,    
         rank = rank,
         lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
-        local_initialization= True,
-        num_epochs = 140,
+        L2_reg = False,
+        local_initialization= local_init,
+        num_epochs = 300,
         learning_rate= learning_rate,
-        batch_size=128,
+        batch_size=64,
         device = device,
         optimizer = "SGD",
-        proximal_gradient= True,
+        proximal_gradient= False,
         project_name=project_name,
-        lr_scheduler= None, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
-        run_name = f"all_prox_{lmbda}"
+        lr_scheduler= Scheduler, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
+        run_name = f"Large Random"
     )
 
 trainer.train()

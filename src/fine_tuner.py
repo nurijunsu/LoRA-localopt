@@ -36,6 +36,7 @@ class LoRALayer(nn.Linear):
         self.weight.requires_grad = False
         self.bias.requires_grad = False
         self.local_init = local_init
+        print(f'local_init in loralayer init:{local_init}')
 
         self.reset_parameters()
         
@@ -49,15 +50,19 @@ class LoRALayer(nn.Linear):
                 nn.init.zeros_(self.lora_B)
                 print('locally initialized')
             else: 
-                nn.init.normal_(self.lora_A, mean=0, std=1)
-                nn.init.normal_(self.lora_B, mean=0, std=1)
-                
-                prod = self.lora_B.data @ self.lora_A.data
-                _, S, _ = torch.linalg.svd(prod)
-                scaling = torch.sqrt(50.0/(S[self.r-1]+1e-5))
+                nn.init.normal_(self.lora_A, mean=0, std=1/10)
+                nn.init.normal_(self.lora_B, mean=0, std=1/10)
+                # nn.init.constant_(self.lora_A, 10)  # Large positive constant
+                # nn.init.constant_(self.lora_B, -10)  # Large negative constant
+                # with torch.no_grad():
+                #     self.lora_A.zero_()
+                #     self.lora_B.zero_()
+                #     self.lora_A[0, 0] = 50  # Only one large value in A
+                #     self.lora_B[0, 0] = -50  # Only one large value in B`
+                # with torch.no_grad():
+                #     nn.init.normal_(self.lora_A, mean=0, std=1/50)
+                #     self.lora_B.data.copy_(self.lora_A.T) 
 
-                self.lora_A.data *= scaling
-                self.lora_B.data *= scaling
                 print('non-locally initialized')
 
     
@@ -81,14 +86,15 @@ class FineTuningTrainer:
         train_dataset,
         test_dataset,
         model: nn.Module, 
-        tuning_weights: str = "last",    # one, last, or all
+        tuning_weights: str = "all",    # one, last, or all
         rank: int = 4,                  # full fine tuning if rank=0
         lmbda: float = 0.01,            # Weight decay OR nuclear-norm coefficient
+        L2_reg: bool = False,
         local_initialization: bool = True,
         num_epochs: int = 100,
         learning_rate: float = 5e-3,
         batch_size:int = 128,
-        grad_clip: float = 10.0,
+        grad_clip: float = 50.0,
         device: str = "cuda",
         project_name: str = None, 
         run_name: str = None,
@@ -115,6 +121,7 @@ class FineTuningTrainer:
         self.tuning_weights = tuning_weights
         self.rank = rank
         self.lmbda = lmbda 
+        self.L2_reg = L2_reg
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
         self.batch_size = batch_size
@@ -127,12 +134,13 @@ class FineTuningTrainer:
         self.model = self.model.to(device)
         # 2. Build optimizer (and optionally a scheduler)
         if optimizer == "SGD":
-            self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.0 if (proximal_gradient or self.rank>0) else 0.9)
+            self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.0 if (L2_reg or proximal_gradient or self.rank>0) else 0.9)
         elif optimizer =="Adam":
             self.optimizer = Adam(self._get_trainable_params(), lr=self.learning_rate)
 
         if lr_scheduler == "ReduceLROnPlateu":
-            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.002, patience=5) 
+
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.001, patience=10, min_lr=5e-7) 
         elif lr_scheduler == "CosineAnnealing":
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                                     self.optimizer,
@@ -206,17 +214,10 @@ class FineTuningTrainer:
         This is used if LoRA == False for nuclear norm regularization.
         """
         total_nuc_norm = 0.0
-        for param in params_list:
-            if param.ndim < 2:
-                # 1D or scalar param => skip or treat as vector norm
-                continue
-            # Flatten the 2D (or more) into 2D for SVD
-            mat = param.view(param.shape[0], -1)
-            # Avoid computing large SVD on huge dims if not needed, 
-            # but let's do it for demonstration
-            _, S, _ = torch.linalg.svd(mat, full_matrices= False)  # or torch.linalg.svd in newer PyTorch
-            nuc_norm = S.sum()
-            total_nuc_norm += nuc_norm
+        if self.rank == 0:
+            total_nuc_norm = sum(torch.norm(X, p='nuc') for X in params_list)
+        else:
+            total_nuc_norm = sum(torch.norm(B @ A, p='nuc') for A, B in zip(params_list[::2], params_list[1::2]))
         return total_nuc_norm
 
     def _compute_rank_of_deltas(self, params_list):
@@ -238,7 +239,7 @@ class FineTuningTrainer:
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
                 # Compute rank based on the threshold
-                threshold = max(5e-5, 1e-3 * S[0])
+                threshold = 1e-3 * min(S[0],1)
                 rank.append(torch.sum(S > threshold).item())
                 sigma_r.append(S[rank[-1]-1])
                 sigma_r_plus_one.append(S[rank[-1]])
@@ -249,7 +250,7 @@ class FineTuningTrainer:
                 mat = B @ A  # Compute the matrix product
                 # Perform SVD
                 _, S, _ = torch.linalg.svd(mat, full_matrices=False)
-                threshold = max(5e-5, 1e-3 * S[0])
+                threshold = 1e-3 * min(S[0],1)
 
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())
@@ -321,7 +322,10 @@ class FineTuningTrainer:
                             nuc_norm = self._compute_nuclear_norm(trainable_params)
                             reg_loss = self.lmbda * nuc_norm                        
                     else:
-                        L2_norm = sum((matrix ** 2).sum() for matrix in trainable_params)
+                        if self.L2_reg:
+                            L2_norm =  sum(torch.norm(B @ A, p='fro')**2 for A, B in zip(trainable_params[::2], trainable_params[1::2]))
+                        else: 
+                            L2_norm = sum((matrix ** 2).sum() for matrix in trainable_params)
                         reg_loss = self.lmbda * L2_norm/2 
                     loss = vanilla_loss + reg_loss
 
@@ -345,12 +349,12 @@ class FineTuningTrainer:
                                     wandb.log({
                                         f"train/rank_{i}": torch.sum(s> 1e-8).item()
                                     }, step = self.global_step)   
-                total_loss += loss.item()
+                total_loss += vanilla_loss.item()
 
                 if self.project_name is not None:
                     wandb.log({
                         "train/vanilla_loss": vanilla_loss,
-                        "train/nuc_norm": nuc_norm if self.rank ==0 else L2_norm/2,
+                        "train/reg": nuc_norm if self.rank ==0 else L2_norm/2,
                         "train/loss": loss.item(),
                         "train/learning_rate": learning_rate,
                         "train/grad_norm": grad_norm,
@@ -365,6 +369,7 @@ class FineTuningTrainer:
             # Compute rank(\Delta W) at end of epoch
             trainable_params = self._get_trainable_params()
             sigma_r , sigma_r_plus_one, rank_deltaW = self._compute_rank_of_deltas(trainable_params)
+            nuc_norm = self._compute_nuclear_norm(trainable_params)
             self.train_loss = total_loss/len(train_loader)
             if self.lr_scheduler is not None:
                 if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -384,6 +389,7 @@ class FineTuningTrainer:
                 wandb.log({
                         "test/total_train_loss": self.train_loss,
                         "test/val_acc": val_acc,
+                        "test/nuc_norm": nuc_norm,
                         **{f"test/rank_{i}": rank_deltaW[i] for i in range(len(rank_deltaW))}, 
                         **{f"test/sigma_r_{i}": sigma_r[i] for i in range(len(sigma_r))}, 
                         **{f"test/sigma_r+1_{i}": sigma_r_plus_one[i] for i in range(len(sigma_r_plus_one))}, 

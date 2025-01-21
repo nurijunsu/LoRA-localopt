@@ -19,12 +19,14 @@ class RSCM_checker:
                  train_dataset,
                  epsilon = 1,
                  RSCM_rank=4, 
+                 lmbda = 0.01,
                  num_samples=1000,):  # Add batch_size parameter
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = pretrained_model.to(self.device)
         self.tuning_weights = tuning_weights
         self.epsilon = epsilon
         self.rank = RSCM_rank
+        self.lmbda = lmbda
         self.num_samples = num_samples
         self.weight_list = self._configure_weights()
         self.train_dataset = train_dataset
@@ -112,11 +114,9 @@ class RSCM_checker:
         A = torch.randn(m, self.rank, device = self.device)
         B = torch.randn(self.rank, n, device = self.device)
         X = A @ B
-        _, S, _ = torch.linalg.svd(X, full_matrices=False)
-        scale_factor = S[self.rank-1] 
-        if scale_factor > 0:
-            X = X * torch.rand(1).item() * self.epsilon / scale_factor
-            
+        scale_factor = self.epsilon / (torch.norm(X, p='nuc')+1e-12)
+        X = X * torch.rand(1).item() * scale_factor        
+
         return X
 
     def compute_gradient(self, delta=None):
@@ -126,7 +126,7 @@ class RSCM_checker:
             parent_module, attr_name = self.weight_list[i]
             lora_layer = getattr(parent_module, attr_name)
             if delta is not None:
-                delta[i].to(self.device)
+                delta[i]=delta[i].to(self.device)
                 original_data.append(lora_layer.delta.data.clone())
                 lora_layer.delta.data.copy_(delta[i])
             accumulated_gradient.append(None)
@@ -143,9 +143,9 @@ class RSCM_checker:
                 lora_layer = getattr(parent_module, attr_name)
                 # Accumulate gradients
                 if accumulated_gradient[i] is None:
-                    accumulated_gradient[i] = lora_layer.delta.grad
+                    accumulated_gradient[i] = lora_layer.delta.grad.clone()
                 else:
-                    accumulated_gradient[i] += lora_layer.delta.grad
+                    accumulated_gradient[i] += lora_layer.delta.grad.clone()
 
         if delta is not None:
             for i in range(len(self.weight_list)):
@@ -243,11 +243,16 @@ class RSCM_checker:
         """
         values_dict = defaultdict(list)
         delta_star = []
+        subgrad_star = []
         
         for parent_module, attr_name in self.weight_list:
             lora_layer = getattr(parent_module, attr_name)
             delta_star.append(lora_layer.delta.data)
         star_gradient = self.compute_gradient()
+        for W in star_gradient:
+            u,s,v = torch.linalg.svd(W, full_matrices= False)
+            s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
+            subgrad_star.append((u @ torch.diag(s)) @ v)
         
         for _ in range(self.num_samples):
             deltas = []
@@ -258,15 +263,18 @@ class RSCM_checker:
             grad = self.compute_gradient(delta= deltas) 
 
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                column_name = f"{parent_module}_{attr_name}"
+                column_name = f"{attr_name}_{i}"
                 # Compute difference
+                u,s,v = torch.linalg.svd(grad[i], full_matrices= False)
+                s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
+                subgrad = (u @ torch.diag(s)) @ v
                 diff = deltas[i] - delta_star[i]
-                gradient_diff = grad[i] - star_gradient[i]
                 # Compute inner product
-                numerator = torch.sum(gradient_diff * diff)
+                numerator = torch.sum((subgrad- subgrad_star[i])* diff)
                 denominator = torch.norm(diff, p='fro') ** 2
-                
-                values_dict[column_name].append((numerator / denominator).item())
+                alpha = (numerator / denominator).item()
+                print(alpha)
+                values_dict[column_name].append(alpha)
                 
         return pd.DataFrame(values_dict)
     
@@ -285,7 +293,7 @@ class RSCM_checker:
         for _ in range(self.num_samples):
             X = []
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                column_name = f"{parent_module}_{attr_name}"
+                column_name = f"{attr_name}_{i}"
                 # Generate X with correct rank within epsilon ball
                 X.append(self.generate_local_rank_r(delta_star[i]))
                 m, n = X.shape
@@ -308,12 +316,12 @@ class RSCM_checker:
     def raw_RSCM(self):
         values_dict = defaultdict(list)
          # Preload all batches to device to avoid redundant data transfers
-        preloaded_batches = [{k: v.to(self.device) for k, v in batch.items()} for batch in self.train_loader]
+        #preloaded_batches = [{k: v.to(self.device) for k, v in batch.items()} for batch in self.train_loader]
         delta_star = []
         for parent_module, attr_name in self.weight_list:
             lora_layer = getattr(parent_module, attr_name)
             delta_star.append(lora_layer.delta.data)
-            original_data = lora_layer.delta.data.clone()
+            #original_data = lora_layer.delta.data.clone()
 
         for _ in range(self.num_samples):
             X = []
@@ -325,35 +333,37 @@ class RSCM_checker:
             grad_X = self.compute_gradient(delta= X)
             grad_Y = self.compute_gradient(delta= Y)
 
-            for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                # Compute loss for X
-                lora_layer.delta.data.copy_(X[i])
-            loss_X = 0
-            with torch.no_grad():
-                for batch in preloaded_batches:
-                    loss_X += self.model(**batch).loss.item()
-                loss_X = loss_X / len(self.train_loader)
+            # for i, (parent_module, attr_name) in enumerate(self.weight_list):
+            #     # Compute loss for X
+            #     lora_layer.delta.data.copy_(X[i])
+            # loss_X = 0
+            # with torch.no_grad():
+            #     for batch in preloaded_batches:
+            #         loss_X += self.model(**batch).loss.item()
+            #     loss_X = loss_X / len(self.train_loader)
 
-            for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                # Compute loss for X
-                lora_layer.delta.data.copy_(Y[i])
-            loss_Y = 0
-            with torch.no_grad():
-                for batch in preloaded_batches:
-                    loss_Y += self.model(**batch).loss.item()
-                loss_Y = loss_Y / len(self.train_loader)
-            # Restore original weights
-            lora_layer.delta.data.copy_(original_data)
+            # for i, (parent_module, attr_name) in enumerate(self.weight_list):
+            #     # Compute loss for X
+            #     lora_layer.delta.data.copy_(Y[i])
+            # loss_Y = 0
+            # with torch.no_grad():
+            #     for batch in preloaded_batches:
+            #         loss_Y += self.model(**batch).loss.item()
+            #     loss_Y = loss_Y / len(self.train_loader)
+            # # Restore original weights
+            # lora_layer.delta.data.copy_(original_data)
                 
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                column_name = f"{parent_module}_{attr_name}"
+                column_name = f"{attr_name}_{i}"
                 # Compute inner product
-                numerator_1 = (loss_Y - loss_X) - torch.sum(grad_X[i] * (Y[i]-X[i]))
-                numerator_2 = (loss_X - loss_Y) - torch.sum(grad_Y[i] * (X[i]-Y[i]))
+                # numerator_1 = (loss_Y - loss_X) - torch.sum(grad_X[i] * (Y[i]-X[i]))
+                # numerator_2 = (loss_X - loss_Y) - torch.sum(grad_Y[i] * (X[i]-Y[i]))
+                numerator = torch.sum((grad_X[i]-grad_Y[i])*(X[i]-Y[i])) +2*torch.norm(X[i]-Y[i],p='nuc')
                 denominator = torch.norm((X[i]-Y[i]), p='fro') ** 2
                 
-                values_dict[column_name].append((numerator_1 / denominator).item())
-                values_dict[column_name].append((numerator_2 / denominator).item())
+                # values_dict[column_name].append((numerator_1 / denominator).item())
+                # values_dict[column_name].append((numerator_2 / denominator).item())
+                values_dict[column_name].append((numerator/denominator).item())
     
         return pd.DataFrame(values_dict)
 
@@ -372,11 +382,11 @@ if __name__ == "__main__":
     train_dataset = CustomDataset(task_name='sst2', split="train")
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, RSCM_rank=RSCM_rank, num_samples=5)
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=20)
 
-    RSCM = checker.raw_RSCM()
-    print(RSCM)
-    RSCM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_rawRSCM_test.csv', index = False)
+    # RSCM = checker.raw_RSCM()
+    # print(RSCM)
+    # RSCM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_rawRSCM_test.csv', index = False)
 
     RSC = checker.RSC()
     RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)

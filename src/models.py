@@ -121,7 +121,6 @@ class Model_Pretrained:
             # For each name (q_proj or v_proj), we freeze/unfreeze or replace with LoRA
             if "q" in q_or_v:
                 self._replace_with_lora(submodule, q_name)
-                print('replaced with lora')
             if "v" in q_or_v and self.tuning_weights!='one':
                 self._replace_with_lora(submodule, v_name)
 
