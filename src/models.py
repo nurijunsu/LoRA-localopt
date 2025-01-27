@@ -9,6 +9,7 @@ class Model_Pretrained:
         self.model_name = model_name.lower()
         self.dataset_name = dataset_name.lower()
         self.valid_roberta_datasets = ['sst2', 'qnli', 'qqp']
+        self.valid_vit_datasets = ['cifar100','beans','food101']
         self.model = self._load_and_modify_model()
         self.rank = rank
         self.local_init = local_init
@@ -22,8 +23,8 @@ class Model_Pretrained:
             if self.dataset_name not in self.valid_roberta_datasets:
                 raise ValueError(f"Dataset {self.dataset_name} not valid for RoBERTa. Use one of {self.valid_roberta_datasets}")
         elif self.model_name == 'vit':
-            if self.dataset_name != 'cifar100':
-                raise ValueError(f"Dataset {self.dataset_name} not valid for ViT. Use 'cifar100'")
+            if self.dataset_name not in self.valid_vit_datasets:
+                raise ValueError(f"Dataset {self.dataset_name} not valid for ViT. Use one of {self.valid_vit_datasets}")
         else:
             raise ValueError(f"Model {self.model_name} not supported. Use 'roberta' or 'vit'")
 
@@ -34,7 +35,8 @@ class Model_Pretrained:
         if self.model_name == 'roberta':
             model = RobertaForSequenceClassification.from_pretrained("roberta-base", num_labels=2)
         else:  # vit
-            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=100, ignore_mismatched_sizes=True)
+            class_num = 100 if self.dataset_name == "cifar100" else 3 if self.dataset_name == "beans" else 101 if self.dataset_name =="food101" else 196
+            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=class_num, ignore_mismatched_sizes=True)
         
         # Freeze all parameters
         for param in model.parameters():

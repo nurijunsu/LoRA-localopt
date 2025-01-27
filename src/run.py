@@ -14,7 +14,7 @@ def parse_args():
     parse.add_argument('--tuning_weights', type=str, help='finetuning type')
     parse.add_argument('--learning_rate', type=float, help ='learning rate')
     parse.add_argument('--rank', type=int, help ='rank')
-    parse.add_argument('--local_init', type=bool, help ='local initialization')
+    parse.add_argument('--local_init', type=str, help ='local initialization')
     parse.add_argument('--Scheduler', type=str, help ='Learning Rate Scheduler')
     args = parse.parse_args()
     return args
@@ -47,7 +47,7 @@ print("Datasets Created")
 # check_labels(test_dataset.dataset_split, "Test Dataset")
 
 
-if task_name == "cifar100":
+if task_name == "cifar100" or "beans" or "food101":
     model_loader = Model_Pretrained("vit",task_name,  fine_tuned=True, rank=rank, tuning_weights=tuning_weights, local_init=local_init)  
 else:
     model_loader = Model_Pretrained("roberta",task_name, fine_tuned=True, rank=rank, tuning_weights=tuning_weights, local_init = local_init)  
@@ -57,7 +57,7 @@ model = model_loader.get_model()
 
 print("Model Loaded")
 
-project_name=f'Intruder local min_{task_name}'
+project_name=f'Demo_LowRank_{task_name}'
 
 
 trainer= FineTuningTrainer(                                                                                                                                                          
@@ -68,16 +68,16 @@ trainer= FineTuningTrainer(
         rank = rank,
         lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
         L2_reg = False,
-        local_initialization= local_init,
+        local_initialization= local_init, #True, LargeRandom, Ortho
         num_epochs = 300,
         learning_rate= learning_rate,
         batch_size=64,
         device = device,
         optimizer = "SGD",
-        proximal_gradient= False,
+        proximal_gradient= True,
         project_name=project_name,
         lr_scheduler= Scheduler, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
-        run_name = f"Large Random"
+        run_name = "Intruder local min_ortho init"
     )
 
 trainer.train()

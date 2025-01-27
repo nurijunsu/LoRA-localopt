@@ -65,10 +65,12 @@ class LinearHeadTrainer:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         dataset_name: str = "default"
     ):
-        self.model = model
+        self.device = device
+        print(f"using device:{self.device}")
+        self.model = model.to(self.device)
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
-        self.device = device
+        
         self.dataset_name = dataset_name
         self.model = self.model.to(self.device)
 
@@ -171,46 +173,93 @@ class LinearHeadTrainer:
             logger.info("Detected RobertaForSequenceClassification. Training its two-layer MLP head directly.")
             self.train_roberta_class_head(epochs=20, lr=1e-3, batch_size=128)
             return None  # We don't return a scikit-learn model
+        
         else:
-            logger.info("Starting to collect features for training dataset (non-RoBERTa)")
-            features, targets = self.collect_features(self.train_dataset)
-            print(f"Features shape: {features.shape}")  # Expected: (N, D)
-            print(f"Targets shape: {targets.shape}")    # Expected: (N,)
+            # Freeze the entire backbone except the classification head
+            for name, param in self.model.named_parameters():
+                if "classifier" not in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
             
-            # Decide if regression or classification
-            if self.model.num_labels == 1:  # Regression
-                targets = torch.tensor(targets).squeeze().unsqueeze(-1).float()
-                reg = LinearRegression().fit(features, targets)
-            else:  # Classification
-                logger.info("Fitting regression model")
-                reg = LogisticRegression(
-                    C=1.0,
-                    solver="saga",
-                    max_iter=200,
-                    multi_class="multinomial",
-                    n_jobs=-1,
-                    random_state=0,
-                    verbose=1  # Add verbosity
-                ).fit(features, targets)
+            
 
-            # Assign weights to model
-            decoder = get_token_prediction_layer(self.model)
-            coef_torch = torch.tensor(reg.coef_, device=self.device, dtype=decoder.weight.dtype)
-            bias_torch = torch.tensor(reg.intercept_, device=self.device, dtype=decoder.bias.dtype)
-            
-            # Handle binary classification case
-            if self.model.num_labels == 2 and coef_torch.size(0) == 1:
-                coef_torch = torch.cat([-coef_torch / 2, coef_torch / 2], dim=0)
-                bias_torch = torch.cat([-bias_torch / 2, bias_torch / 2], dim=0)
-            
-            # Update model weights
-            decoder.weight.data = coef_torch
-            decoder.bias.data = bias_torch
-            
-            # Save the trained head
+            train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=256,
+                shuffle=True,
+                pin_memory=True
+            )
+
+            # Simple Adam optimizer
+            optimizer = torch.optim.AdamW(
+                params=[p for p in self.model.parameters() if p.requires_grad],
+                lr=0.001,
+                weight_decay=1e-3
+            )
+
+            self.model.train()
+            for epoch in range(50):
+                total_loss = 0.0
+                for batch in tqdm(train_loader):
+                    batch = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                    outputs = self.model(**batch)
+                    loss = outputs.loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+
+                avg_loss = total_loss / len(train_loader)
+                logger.info(f"[Epoch {epoch+1}] loss: {avg_loss:.4f}")
+
+            # (Optional) Save the classification head after training
             self.save_head()
+        # else:
+        #     logger.info("Starting to collect features for training dataset (non-RoBERTa)")
+        #     features, targets = self.collect_features(self.train_dataset)
+        #     print(f"Features shape: {features.shape}")  # Expected: (N, D)
+        #     print(f"Targets shape: {targets.shape}")    # Expected: (N,)
             
-            return reg
+        #     # Decide if regression or classification
+        #     if self.model.num_labels == 1:  # Regression
+        #         targets = torch.tensor(targets).squeeze().unsqueeze(-1).float()
+        #         reg = LinearRegression().fit(features, targets)
+        #     else:  # Classification
+        #         logger.info("Fitting regression model")
+        #         reg = LogisticRegression(
+        #             C=1.0,
+        #             solver="saga",
+        #             max_iter=50,
+        #             multi_class="multinomial",
+        #             n_jobs=-1,
+        #             random_state=0,
+        #             verbose=1  # Add verbosity
+        #         ).fit(features, targets)
+
+        #     # Assign weights to model
+        #     decoder = get_token_prediction_layer(self.model)
+        #     print(f"LogisticRegression coef shape: {reg.coef_.shape}")        # Should be (101, D)
+        #     print(f"LogisticRegression intercept shape: {reg.intercept_.shape}")  # Should be (101,)
+
+        #     coef_torch = torch.tensor(reg.coef_, device=self.device, dtype=decoder.weight.dtype)
+        #     bias_torch = torch.tensor(reg.intercept_, device=self.device, dtype=decoder.bias.dtype)
+            
+        #     # Handle binary classification case
+        #     if self.model.num_labels == 2 and coef_torch.size(0) == 1:
+        #         coef_torch = torch.cat([-coef_torch / 2, coef_torch / 2], dim=0)
+        #         bias_torch = torch.cat([-bias_torch / 2, bias_torch / 2], dim=0)
+            
+        #     # Update model weights
+        #     decoder.weight.data = coef_torch
+        #     decoder.bias.data = bias_torch
+            
+        #     # Save the trained head
+        #     self.save_head()
+            
+        #     return reg
 
     def save_head(self):
         """Save the trained classification head weights and biases."""
@@ -301,7 +350,7 @@ def main():
     print(f"Using device: {device}")
     from models import Model_Pretrained
     # Choose a task
-    for task_name in ["cifar100"]:  # e.g., "sst2", "qnli", "qqp", "cifar100", "superb_ic"
+    for task_name in ["food101","beans"]:  # e.g., "sst2", "qnli", "qqp", "cifar100", "superb_ic"
         # Create custom datasets
         train_dataset = CustomDataset(task_name=task_name, split="train")
         test_dataset = CustomDataset(task_name=task_name, split="test")
@@ -311,16 +360,15 @@ def main():
         # check_labels(train_dataset.dataset_split, "Train Dataset")
         # check_labels(test_dataset.dataset_split, "Test Dataset")
 
-        if task_name == "cifar100":
-            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=100, ignore_mismatched_sizes=True)
+        if task_name in ["cifar100","beans","food101"]:
+            class_num = 100 if task_name == "cifar100" else 3 if task_name == "beans" else 101 
+            model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224", num_labels=class_num, ignore_mismatched_sizes=True)
         else:
             # # # Example: Using RobertaForSequenceClassification with 2 labels
             model = RobertaForSequenceClassification.from_pretrained("roberta-base", num_labels=2, ignore_mismatched_sizes=True)
         print("Model loaded")
 
-        
-        model_loader = Model_Pretrained("vit",task_name)  
-        model = model_loader.get_model()
+    
         #Initialize trainer
         linearheadtrainer = LinearHeadTrainer(
             model=model,
@@ -329,12 +377,19 @@ def main():
             device=device,
             dataset_name=task_name
         )
+
+        # print("Evaluating...")
+        # metrics = linearheadtrainer.evaluate()
+        # print(f"Evaluation metrics: {metrics}")
         
-        # # Train
-        # print("Starting training...")
-        # linearheadtrainer.train() 
+        # # # Train
+        print("Starting training...")
+        linearheadtrainer.train() 
         
         # Evaluate
+        # To evaluate only
+        # model_loader = Model_Pretrained("vit",task_name)  
+        # model = model_loader.get_model()
         print("Evaluating...")
         metrics = linearheadtrainer.evaluate()
         print(f"Evaluation metrics: {metrics}")

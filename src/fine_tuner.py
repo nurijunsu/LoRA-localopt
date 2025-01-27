@@ -21,7 +21,7 @@ class LoRALayer(nn.Linear):
             out_features: int, 
             r: int,
             lora_alpha: int =0,
-            local_init: bool =True,
+            local_init: str = "True",
             **kwargs
     ):
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
@@ -36,7 +36,6 @@ class LoRALayer(nn.Linear):
         self.weight.requires_grad = False
         self.bias.requires_grad = False
         self.local_init = local_init
-        print(f'local_init in loralayer init:{local_init}')
 
         self.reset_parameters()
         
@@ -44,26 +43,27 @@ class LoRALayer(nn.Linear):
     def reset_parameters(self):
         nn.Linear.reset_parameters(self) 
         if hasattr(self, 'lora_A'):
-            if self.local_init:
+            if self.local_init=="True":
                 # initialize B the same way as the default for nn.Linear and A to zero
                 nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
                 nn.init.zeros_(self.lora_B)
                 print('locally initialized')
-            else: 
-                nn.init.normal_(self.lora_A, mean=0, std=1/10)
-                nn.init.normal_(self.lora_B, mean=0, std=1/10)
-                # nn.init.constant_(self.lora_A, 10)  # Large positive constant
+            elif self.local_init == "LargeRandom":
+                nn.init.normal_(self.lora_A, mean=0, std=1/5)
+                nn.init.normal_(self.lora_B, mean=0, std=1/5)
+                print('initialized with large random')
+            elif self.local_init == "Ortho":
+                with torch.no_grad():
+                    nn.init.normal_(self.lora_A, mean=0, std=1/10)
+                    self.lora_B.data.copy_(self.lora_A.T) 
+            # nn.init.constant_(self.lora_A, 10)  # Large positive constant
                 # nn.init.constant_(self.lora_B, -10)  # Large negative constant
                 # with torch.no_grad():
                 #     self.lora_A.zero_()
                 #     self.lora_B.zero_()
                 #     self.lora_A[0, 0] = 50  # Only one large value in A
                 #     self.lora_B[0, 0] = -50  # Only one large value in B`
-                # with torch.no_grad():
-                #     nn.init.normal_(self.lora_A, mean=0, std=1/50)
-                #     self.lora_B.data.copy_(self.lora_A.T) 
-
-                print('non-locally initialized')
+                print('orthogonally initialized')
 
     
     def forward(self, x:torch.Tensor):
@@ -140,7 +140,7 @@ class FineTuningTrainer:
 
         if lr_scheduler == "ReduceLROnPlateu":
 
-            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.001, patience=10, min_lr=5e-7) 
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.0005, patience=30, min_lr=5e-7) 
         elif lr_scheduler == "CosineAnnealing":
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                                     self.optimizer,
@@ -242,7 +242,10 @@ class FineTuningTrainer:
                 threshold = 1e-3 * min(S[0],1)
                 rank.append(torch.sum(S > threshold).item())
                 sigma_r.append(S[rank[-1]-1])
-                sigma_r_plus_one.append(S[rank[-1]])
+                if rank[-1]<len(S):
+                    sigma_r_plus_one.append(S[rank[-1]])
+                else:
+                    sigma_r_plus_one.append(0)
         else:
             for i in range(0, len(params_list), 2):
                 A = params_list[i]     # Get A matrix

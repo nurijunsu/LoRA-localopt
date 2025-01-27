@@ -264,17 +264,23 @@ class RSCM_checker:
 
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
                 column_name = f"{attr_name}_{i}"
+                column_name_sub = f"{attr_name}_{i}_sub"
                 # Compute difference
                 u,s,v = torch.linalg.svd(grad[i], full_matrices= False)
                 s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
                 subgrad = (u @ torch.diag(s)) @ v
                 diff = deltas[i] - delta_star[i]
                 # Compute inner product
-                numerator = torch.sum((subgrad- subgrad_star[i])* diff)
+                numerator = torch.sum((grad[i]- star_gradient[i])* diff)
+                numerator_sub = torch.sum((subgrad- subgrad_star[i])* diff)
                 denominator = torch.norm(diff, p='fro') ** 2
                 alpha = (numerator / denominator).item()
                 print(alpha)
                 values_dict[column_name].append(alpha)
+                alpha_sub = (numerator_sub / denominator).item()
+                print(alpha_sub)
+                values_dict[column_name_sub].append(alpha_sub)
+                
                 
         return pd.DataFrame(values_dict)
     
@@ -296,7 +302,7 @@ class RSCM_checker:
                 column_name = f"{attr_name}_{i}"
                 # Generate X with correct rank within epsilon ball
                 X.append(self.generate_local_rank_r(delta_star[i]))
-                m, n = X.shape
+                m, n = X[i].shape
                 
                 u1 = torch.rand(m, 1, device=self.device)  # m×1 vector
                 u2 = torch.rand(1, m, device=self.device)  # 1×m vector
@@ -306,12 +312,15 @@ class RSCM_checker:
                 v2 = torch.rand(1, n, device=self.device)
                 V = v1 @ v2
 
-                direction = U @ X + X @ V
+                direction = U @ X[i] + X[i] @ V
 
-                beta = self.compute_Hessian_vector_prod((parent_module, attr_name), X, direction)/(torch.norm(direction, p='fro')**2)
+                beta = self.compute_Hessian_vector_prod((parent_module, attr_name), X[i], direction)/(torch.norm(direction, p='fro')**2)
+                print(beta)
                 values_dict[column_name].append(beta.item())
     
         return pd.DataFrame(values_dict)
+    
+
     
     def raw_RSCM(self):
         values_dict = defaultdict(list)
@@ -372,7 +381,7 @@ if __name__ == "__main__":
     model_name = 'roberta'
     dataset_name = 'sst2'
     tuning_weights = 'all'
-    RSCM_rank = 4
+    RSCM_rank = 16
     lmbda = 0.01
 
     # Load the model, pretrained and classifier-trained and fine tuned
@@ -382,7 +391,7 @@ if __name__ == "__main__":
     train_dataset = CustomDataset(task_name='sst2', split="train")
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=20)
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=100)
 
     # RSCM = checker.raw_RSCM()
     # print(RSCM)

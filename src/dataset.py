@@ -57,7 +57,7 @@ class CustomDataset(torch.utils.data.Dataset):
         self.image_transform = transforms.Compose([
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
 
     def _prepare_dataset(self):
@@ -109,8 +109,18 @@ class CustomDataset(torch.utils.data.Dataset):
 
         elif self.task_name == "cifar100":
             processed = load_dataset("cifar100")
+        
+        elif self.task_name =="beans":
+            processed = load_dataset("beans")
 
-
+        elif self.task_name =="food101":
+            train = load_dataset("food101", split="train[:10%]")
+            validation = load_dataset("food101", split="validation[:10%]")
+            processed = DatasetDict({
+                "train": train,
+                "validation": validation
+            })            
+            
         elif self.task_name == "superb_ic":
             raw = load_dataset("superb", "ic")
             feature_extractor = AutoProcessor.from_pretrained(self.wav2vec2_name)
@@ -134,6 +144,7 @@ class CustomDataset(torch.utils.data.Dataset):
         # We only need train/test splits. Some datasets have validation sets; 
         # We'll consider 'validation' as 'test' if no test split available.
         # Check splits
+        
         split_names = processed.keys()
         if "validation" in split_names:
             processed = DatasetDict({
@@ -147,6 +158,7 @@ class CustomDataset(torch.utils.data.Dataset):
             })
 
 
+
         return processed
 
     def __len__(self):
@@ -158,6 +170,22 @@ class CustomDataset(torch.utils.data.Dataset):
         if self.task_name == "cifar100":
             pixel_values = self.image_transform(item["img"])
             labels = item["fine_label"]
+            
+            return {
+                "pixel_values": pixel_values,
+                "labels": labels
+            }
+        elif self.task_name =="beans":
+            pixel_values = self.image_transform(item["image"])
+            labels = item["labels"]
+            
+            return {
+                "pixel_values": pixel_values,
+                "labels": labels
+            }
+        elif self.task_name in ["food101"]:
+            pixel_values = self.image_transform(item["image"])
+            labels = item["label"]
             
             return {
                 "pixel_values": pixel_values,
