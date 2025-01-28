@@ -54,7 +54,7 @@ class LoRALayer(nn.Linear):
                 print('initialized with large random')
             elif self.local_init == "Ortho":
                 with torch.no_grad():
-                    nn.init.normal_(self.lora_A, mean=0, std=1/10)
+                    nn.init.normal_(self.lora_A, mean=0, std=1/20)
                     self.lora_B.data.copy_(self.lora_A.T) 
             # nn.init.constant_(self.lora_A, 10)  # Large positive constant
                 # nn.init.constant_(self.lora_B, -10)  # Large negative constant
@@ -87,7 +87,8 @@ class FineTuningTrainer:
         test_dataset,
         model: nn.Module, 
         tuning_weights: str = "all",    # one, last, or all
-        rank: int = 4,                  # full fine tuning if rank=0
+        rank: int = 16,                  # full fine tuning if rank=0
+        rank_star: int = 5,               # rank of global min    
         lmbda: float = 0.01,            # Weight decay OR nuclear-norm coefficient
         L2_reg: bool = False,
         local_initialization: bool = True,
@@ -120,6 +121,7 @@ class FineTuningTrainer:
         self.test_dataset = test_dataset
         self.tuning_weights = tuning_weights
         self.rank = rank
+        self.rank_star = rank_star
         self.lmbda = lmbda 
         self.L2_reg = L2_reg
         self.num_epochs = num_epochs
@@ -139,8 +141,7 @@ class FineTuningTrainer:
             self.optimizer = Adam(self._get_trainable_params(), lr=self.learning_rate)
 
         if lr_scheduler == "ReduceLROnPlateu":
-
-            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, threshold = 0.0005, patience=30, min_lr=5e-7) 
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, threshold = 0.002, patience=5, min_lr=5e-7) 
         elif lr_scheduler == "CosineAnnealing":
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                                     self.optimizer,
@@ -229,7 +230,7 @@ class FineTuningTrainer:
         # The rank is the number of singular values above a threshold, e.g. 1e-5.
         rank = []
         sigma_r = []
-        sigma_r_plus_one = []
+        sigma_r_star = []
         if self.rank == 0:
             for param in params_list:
                 if param.ndim < 2:
@@ -242,10 +243,7 @@ class FineTuningTrainer:
                 threshold = 1e-3 * min(S[0],1)
                 rank.append(torch.sum(S > threshold).item())
                 sigma_r.append(S[rank[-1]-1])
-                if rank[-1]<len(S):
-                    sigma_r_plus_one.append(S[rank[-1]])
-                else:
-                    sigma_r_plus_one.append(0)
+                sigma_r_star.append(S[self.rank_star])
         else:
             for i in range(0, len(params_list), 2):
                 A = params_list[i]     # Get A matrix
@@ -258,9 +256,9 @@ class FineTuningTrainer:
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())
                 sigma_r.append(S[rank[-1]-1])
-                sigma_r_plus_one.append(S[rank[-1]])
+                sigma_r_star.append(S[self.rank_star])
 
-        return sigma_r, sigma_r_plus_one, rank
+        return sigma_r, sigma_r_star, rank
 
     
     
@@ -279,6 +277,7 @@ class FineTuningTrainer:
         for epoch in range(self.num_epochs):
             self.model.train()
             total_loss = 0.0
+            total_reg = 0.0
 
             def collate_fn(batch):
                 # Each item is a dict with 'input_ids', 'attention_mask', 'labels', etc.
@@ -353,6 +352,7 @@ class FineTuningTrainer:
                                         f"train/rank_{i}": torch.sum(s> 1e-8).item()
                                     }, step = self.global_step)   
                 total_loss += vanilla_loss.item()
+                total_reg += reg_loss.item()
 
                 if self.project_name is not None:
                     wandb.log({
@@ -371,9 +371,10 @@ class FineTuningTrainer:
 
             # Compute rank(\Delta W) at end of epoch
             trainable_params = self._get_trainable_params()
-            sigma_r , sigma_r_plus_one, rank_deltaW = self._compute_rank_of_deltas(trainable_params)
+            sigma_r , sigma_r_star, rank_deltaW = self._compute_rank_of_deltas(trainable_params)
             nuc_norm = self._compute_nuclear_norm(trainable_params)
             self.train_loss = total_loss/len(train_loader)
+            reg_loss = total_reg/len(train_loader)
             if self.lr_scheduler is not None:
                 if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.lr_scheduler.step(self.train_loss)  # Pass train_loss for ReduceLROnPlateau
@@ -392,10 +393,12 @@ class FineTuningTrainer:
                 wandb.log({
                         "test/total_train_loss": self.train_loss,
                         "test/val_acc": val_acc,
+                        "test/reg_loss": reg_loss,
                         "test/nuc_norm": nuc_norm,
                         **{f"test/rank_{i}": rank_deltaW[i] for i in range(len(rank_deltaW))}, 
                         **{f"test/sigma_r_{i}": sigma_r[i] for i in range(len(sigma_r))}, 
-                        **{f"test/sigma_r+1_{i}": sigma_r_plus_one[i] for i in range(len(sigma_r_plus_one))}, 
+                        **{f"test/sigma_r_star_{i}": sigma_r_star[i] for i in range(len(sigma_r_star))}, 
+                        "test/sigma_ratio(weight 1)": sigma_r_star[1]/sigma_r[1],
                         "epoch": epoch  
                     }, step = self.global_step)
         

@@ -30,7 +30,7 @@ class RSCM_checker:
         self.num_samples = num_samples
         self.weight_list = self._configure_weights()
         self.train_dataset = train_dataset
-        self.batch_size = 128
+        self.batch_size = 192
 
         def collate_fn(batch):
             input_ids = torch.stack([torch.tensor(x["input_ids"]) for x in batch], dim=0)
@@ -232,7 +232,93 @@ class RSCM_checker:
         
         return hvp_scalar
     
-    def RSC(self) -> List[float]:
+    def compute_Hessian_vector_prod_full(self, delta, direction):
+        """
+        Compute the scalar value of direction^T H direction, where H is the Hessian
+        of the loss function with respect to delta.
+        Args:
+            delta: The perturbation tensor.
+            direction: The vector to compute the Hessian product with.
+        Returns:
+            hvp_scalar: The scalar value of direction^T H direction.
+        """
+        # Ensure delta requires gradient
+        original_data = []
+        hessian_vector = []
+        
+        for i in range(len(self.weight_list)):
+            parent_module, attr_name = self.weight_list[i]
+            lora_layer = getattr(parent_module, attr_name)
+            if delta[i] is not None:
+                delta[i]=delta[i].to(self.device)
+                original_data.append(lora_layer.delta.data.detach().cpu())
+                # delta[i].requires_grad_(True)
+                lora_layer.delta = nn.Parameter(delta[i].to(self.device), requires_grad=True)
+
+        # #Run on a subset dataset for fast running and debugging
+        # subset_dataset = torch.utils.data.Subset(self.train_dataset, range(100))  # Use a subset
+        # subset_loader = DataLoader(
+        #     subset_dataset, 
+        #     batch_size = self.batch_size,
+        #     shuffle = False, 
+        #     collate_fn=self.train_loader.collate_fn
+        # )
+ 
+        hvp = [0.0 for _ in range(len(self.weight_list))]
+        # Compute the loss
+        for batch in tqdm(self.train_loader):  
+            hessian_vector = []
+            loss=0.0   
+            grad_dot_direction =0.0       
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            with autocast():
+                loss = self.model(**batch).loss / len(self.train_loader)
+
+            self.model.zero_grad()
+            loss.backward(create_graph = True)
+
+            for i in range(len(self.weight_list)):
+                parent_module, attr_name = self.weight_list[i]
+                lora_layer = getattr(parent_module, attr_name)
+                # Compute the first gradient (grad of loss w.r.t. delta)
+                with autocast():
+                    grad = lora_layer.delta.grad
+                # Compute the dot product of grad and direction
+                grad_dot_direction += torch.dot(grad.view(-1), direction[i].view(-1))
+                
+            grad_dot_direction.backward()
+            
+            for i in range(len(self.weight_list)):
+                parent_module, attr_name = self.weight_list[i]
+                lora_layer = getattr(parent_module, attr_name)
+            # Compute the second gradient (Hessian-vector product)
+                hessian_vector.append(lora_layer.delta.grad)
+            
+            # Compute the scalar value of direction^T H direction
+            for i in range(len(self.weight_list)):
+                hvp[i] += torch.dot(hessian_vector[i].view(-1), direction[i].view(-1))
+
+            # Delete intermediate variables to free memory
+            del loss
+            del grad
+            del grad_dot_direction
+            del hessian_vector
+
+        # Clear gradients of delta for the next iteration
+        for i in range(len(self.weight_list)):
+            parent_module, attr_name = self.weight_list[i]
+            lora_layer = getattr(parent_module, attr_name)
+            if lora_layer.delta.grad is not None:
+                lora_layer.delta.grad.zero_()
+ 
+        for i in range(len(self.weight_list)):
+            parent_module, attr_name = self.weight_list[i]
+            lora_layer = getattr(parent_module, attr_name)
+            lora_layer.delta.data.copy_(original_data[i])
+        
+        return hvp
+    
+    def RSC(self, save_path) -> List[float]:
         """
         Check restricted strong convexity by computing:
         <∇L(delta), delta - delta*> / ||delta - delta*||_F^2
@@ -264,46 +350,46 @@ class RSCM_checker:
 
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
                 column_name = f"{attr_name}_{i}"
-                column_name_sub = f"{attr_name}_{i}_sub"
+                # column_name_sub = f"{attr_name}_{i}_sub"
                 # Compute difference
-                u,s,v = torch.linalg.svd(grad[i], full_matrices= False)
-                s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
-                subgrad = (u @ torch.diag(s)) @ v
+                # u,s,v = torch.linalg.svd(grad[i], full_matrices= False)
+                # s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
+                # subgrad = (u @ torch.diag(s)) @ v
                 diff = deltas[i] - delta_star[i]
                 # Compute inner product
                 numerator = torch.sum((grad[i]- star_gradient[i])* diff)
-                numerator_sub = torch.sum((subgrad- subgrad_star[i])* diff)
+                # numerator_sub = torch.sum((subgrad- subgrad_star[i])* diff)
                 denominator = torch.norm(diff, p='fro') ** 2
                 alpha = (numerator / denominator).item()
-                print(alpha)
                 values_dict[column_name].append(alpha)
-                alpha_sub = (numerator_sub / denominator).item()
-                print(alpha_sub)
-                values_dict[column_name_sub].append(alpha_sub)
+                # alpha_sub = (numerator_sub / denominator).item()
+                # print(alpha_sub)
+                # values_dict[column_name_sub].append(alpha_sub)
                 
-                
+            pd.DataFrame(values_dict).to_csv(save_path, index=False, mode='a', header=False)
+
         return pd.DataFrame(values_dict)
     
-    def RSM(self) -> List[float]:
+    def RSM(self, save_path) -> List[float]:
         """
         Compute β_local(X) for matrices X of rank ≤ test_rank within epsilon ball of delta_star.
         Uses random sampling followed by rank projection and validation.
         """
         values_dict = defaultdict(list)
         delta_star = []
+        direction = []
         for parent_module, attr_name in self.weight_list:
             lora_layer = getattr(parent_module, attr_name)
             delta_star.append(lora_layer.delta.data)
     
         
         for _ in range(self.num_samples):
-            X = []
-            for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                column_name = f"{attr_name}_{i}"
-                # Generate X with correct rank within epsilon ball
+            X = []      
+            # Generate X with correct rank within epsilon ball
+            for i in range(len(self.weight_list)):
                 X.append(self.generate_local_rank_r(delta_star[i]))
                 m, n = X[i].shape
-                
+            
                 u1 = torch.rand(m, 1, device=self.device)  # m×1 vector
                 u2 = torch.rand(1, m, device=self.device)  # 1×m vector
                 U = u1 @ u2
@@ -312,11 +398,15 @@ class RSCM_checker:
                 v2 = torch.rand(1, n, device=self.device)
                 V = v1 @ v2
 
-                direction = U @ X[i] + X[i] @ V
+                direction.append(U @ X[i] + X[i] @ V)
+            hvp = self.compute_Hessian_vector_prod_full(X, direction)
 
-                beta = self.compute_Hessian_vector_prod((parent_module, attr_name), X[i], direction)/(torch.norm(direction, p='fro')**2)
-                print(beta)
+            for i, (parent_module, attr_name) in enumerate(self.weight_list):
+                column_name = f"{attr_name}_{i}" 
+                beta = hvp[i]/(torch.norm(direction[i], p='fro')**2)
                 values_dict[column_name].append(beta.item())
+            
+            pd.DataFrame(values_dict).to_csv(save_path, index=False, mode='a', header=False)
     
         return pd.DataFrame(values_dict)
     
@@ -381,25 +471,24 @@ if __name__ == "__main__":
     model_name = 'roberta'
     dataset_name = 'sst2'
     tuning_weights = 'all'
-    RSCM_rank = 16
-    lmbda = 0.01
+    RSCM_rank = 8
+    lmbda = 0.005
 
     # Load the model, pretrained and classifier-trained and fine tuned
     pretrained_model =  Model_Pretrained(model_name=model_name, dataset_name=dataset_name, fine_tuned=True, rank = 0, tuning_weights= tuning_weights).get_model()
-    pretrained_model.load_state_dict(torch.load(f'../logs/{dataset_name}/tuned={tuning_weights}_LoRA=0/lambda_{lmbda}/lambda_{lmbda}_epoch_50_lr.pth'))
+    pretrained_model.load_state_dict(torch.load(f'../logs/{dataset_name}/tuned={tuning_weights}_LoRA=0/lambda_{lmbda}/lambda_{lmbda}_epoch_100_lr.pth'))
 
     train_dataset = CustomDataset(task_name='sst2', split="train")
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=100)
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=1)
 
-    # RSCM = checker.raw_RSCM()
-    # print(RSCM)
-    # RSCM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_rawRSCM_test.csv', index = False)
+    RSCM = checker.raw_RSCM()
+    RSCM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_rawRSCM_test.csv', index = False)
 
-    RSC = checker.RSC()
-    RSC.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv', index = False)
+    save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv'
+    RSC = checker.RSC(save_path)
 
-    # RSM = checker.RSM()
-    # RSM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv', index = False)
+    # save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv'
+    # RSM = checker.RSM(save_path)
     
