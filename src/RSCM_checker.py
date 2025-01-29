@@ -11,13 +11,14 @@ import pandas as pd
 from collections import defaultdict
 from torch.cuda.amp import autocast, GradScaler
 import gc
+import math
 
 class RSCM_checker:
     def __init__(self, 
                  pretrained_model, 
                  tuning_weights, 
                  train_dataset,
-                 epsilon = 1,
+                 epsilon = 0.01,
                  RSCM_rank=4, 
                  lmbda = 0.01,
                  num_samples=1000,):  # Add batch_size parameter
@@ -109,14 +110,26 @@ class RSCM_checker:
                 weight_list.append((submodule, v_name))
         return weight_list
     
-    def generate_local_rank_r(self, matrix):
-        m, n = matrix.shape
-        A = torch.randn(m, self.rank, device = self.device)
-        B = torch.randn(self.rank, n, device = self.device)
-        X = A @ B
-        scale_factor = self.epsilon / (torch.norm(X, p='nuc')+1e-12)
-        X = X * torch.rand(1).item() * scale_factor        
+    def generate_local_rank_r(self, X, A, B):         
+        for _ in range(100):
+            # Much more conservative scaling
+            # Scale by epsilon/(10 * sqrt(rank) * (1 + op_norm))
+            # This accounts for:
+            # 1. Cross terms in multiplication
+            # 2. Rank of the matrices
+            # 3. Original matrix magnitude
+            scale = self.epsilon / (10*math.sqrt(self.rank *768))
 
+            A_p = A + torch.randn_like(A) * torch.rand(1).item()* scale
+            B_p = B + torch.randn_like(B) * scale
+            
+            # Reconstruct matrix as AB^T
+            X_p = A_p @ B_p.T
+            
+            if torch.norm(X_p - X, p='fro') < self.epsilon:
+                return X_p.to(self.device)
+
+        print("failed to generate local matrix. Try smaller scale")
         return X
 
     def compute_gradient(self, delta=None):
@@ -130,6 +143,13 @@ class RSCM_checker:
                 original_data.append(lora_layer.delta.data.clone())
                 lora_layer.delta.data.copy_(delta[i])
             accumulated_gradient.append(None)
+        # subset_dataset = torch.utils.data.Subset(self.train_dataset, range(100))  # Use a subset
+        # subset_loader = DataLoader(
+        #     subset_dataset, 
+        #     batch_size = self.batch_size,
+        #     shuffle = False, 
+        #     collate_fn=self.train_loader.collate_fn
+        # )
         
         for batch in tqdm(self.train_loader):
             self.model.zero_grad()     
@@ -337,16 +357,26 @@ class RSCM_checker:
             lora_layer = getattr(parent_module, attr_name)
             delta_star.append(lora_layer.delta.data)
         star_gradient = self.compute_gradient()
-        for W in star_gradient:
-            u,s,v = torch.linalg.svd(W, full_matrices= False)
-            s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
-            subgrad_star.append((u @ torch.diag(s)) @ v)
+        # for W in star_gradient:
+        #     u,s,v = torch.linalg.svd(W, full_matrices= False)
+        #     s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
+        #     subgrad_star.append((u @ torch.diag(s)) @ v)
         
         for _ in range(self.num_samples):
             deltas = []
             values_dict = defaultdict(list)
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                deltas.append(self.generate_local_rank_r(delta_star[i]))
+                U,S,V = torch.linalg.svd(delta_star[i], full_matrices= False)
+                U_r = U[:, :self.rank]
+                S_r = S[:self.rank]
+                V_r = V.T[:, :self.rank]               
+                # Compute square root of singular values
+                S_sqrt = torch.sqrt(S_r)
+                
+                # Compute compact A and B components (m×r and n×r matrices)
+                A = U_r @ torch.diag(S_sqrt)  # m×r
+                B = V_r @ torch.diag(S_sqrt)  # n×r
+                deltas.append(self.generate_local_rank_r(delta_star[i], A, B))
             
             # Compute gradient at delta
             grad = self.compute_gradient(delta= deltas) 
@@ -355,12 +385,11 @@ class RSCM_checker:
                 column_name = f"{attr_name}_{i}"
                 # column_name_sub = f"{attr_name}_{i}_sub"
                 # Compute difference
-                # u,s,v = torch.linalg.svd(grad[i], full_matrices= False)
-                # s = torch.nn.Threshold(0, 0)(s- self.lmbda)  #Soft-thresholding operator 
-                # subgrad = (u @ torch.diag(s)) @ v
                 diff = deltas[i] - delta_star[i]
                 # Compute inner product
-                numerator = torch.sum((grad[i]- star_gradient[i])* diff)
+                u,_,v = torch.linalg.svd(star_gradient[i], full_matrices= False)
+                star_g = -self.lmbda * (u @ v)
+                numerator = torch.sum((grad[i] - star_g)* diff)
                 # numerator_sub = torch.sum((subgrad- subgrad_star[i])* diff)
                 denominator = torch.norm(diff, p='fro') ** 2
                 alpha = (numerator / denominator).item()
@@ -390,7 +419,17 @@ class RSCM_checker:
             values_dict = defaultdict(list)
             # Generate X with correct rank within epsilon ball
             for i in range(len(self.weight_list)):
-                X.append(self.generate_local_rank_r(delta_star[i]))
+                U,S,V = torch.linalg.svd(delta_star[i], full_matrices= False)
+                U_r = U[:, :self.rank]
+                S_r = S[:self.rank]
+                V_r = V.T[:, :self.rank]               
+                # Compute square root of singular values
+                S_sqrt = torch.sqrt(S_r)
+                
+                # Compute compact A and B components (m×r and n×r matrices)
+                A = U_r @ torch.diag(S_sqrt)  # m×r
+                B = V_r @ torch.diag(S_sqrt)  # n×r
+                X.append(self.generate_local_rank_r(delta_star[i], A, B))
                 m, n = X[i].shape
             
                 u1 = torch.rand(m, 1, device=self.device)  # m×1 vector
@@ -415,62 +454,62 @@ class RSCM_checker:
     
 
     
-    def raw_RSCM(self, save_path):
-        values_dict = defaultdict(list)
-         # Preload all batches to device to avoid redundant data transfers
-        #preloaded_batches = [{k: v.to(self.device) for k, v in batch.items()} for batch in self.train_loader]
-        delta_star = []
-        for parent_module, attr_name in self.weight_list:
-            lora_layer = getattr(parent_module, attr_name)
-            delta_star.append(lora_layer.delta.data)
-            #original_data = lora_layer.delta.data.clone()
+    # def raw_RSCM(self, save_path):
+    #     values_dict = defaultdict(list)
+    #      # Preload all batches to device to avoid redundant data transfers
+    #     preloaded_batches = [{k: v.to(self.device) for k, v in batch.items()} for batch in self.train_loader]
+    #     delta_star = []
+    #     for parent_module, attr_name in self.weight_list:
+    #         lora_layer = getattr(parent_module, attr_name)
+    #         delta_star.append(lora_layer.delta.data)
+    #         original_data = lora_layer.delta.data.clone()
 
-        for _ in range(self.num_samples):
-            X = []
-            Y = []
-            values_dict = defaultdict(list)
-            for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                X.append(self.generate_local_rank_r(delta_star[i]))
-                Y.append(self.generate_local_rank_r(delta_star[i]))
+    #     for _ in range(self.num_samples):
+    #         X = []
+    #         Y = []
+    #         values_dict = defaultdict(list)
+    #         for i, (parent_module, attr_name) in enumerate(self.weight_list):
+    #             X.append(self.generate_local_rank_r(delta_star[i]))
+    #             Y.append(self.generate_local_rank_r(delta_star[i]))
             
-            grad_X = self.compute_gradient(delta= X)
-            grad_Y = self.compute_gradient(delta= Y)
+    #         grad_X = self.compute_gradient(delta= X)
+    #         grad_Y = self.compute_gradient(delta= Y)
 
-            # for i, (parent_module, attr_name) in enumerate(self.weight_list):
-            #     # Compute loss for X
-            #     lora_layer.delta.data.copy_(X[i])
-            # loss_X = 0
-            # with torch.no_grad():
-            #     for batch in preloaded_batches:
-            #         loss_X += self.model(**batch).loss.item()
-            #     loss_X = loss_X / len(self.train_loader)
+    #         for i, (parent_module, attr_name) in enumerate(self.weight_list):
+    #             # Compute loss for X
+    #             lora_layer.delta.data.copy_(X[i])
+    #         loss_X = 0
+    #         with torch.no_grad():
+    #             for batch in preloaded_batches:
+    #                 loss_X += self.model(**batch).loss.item()
+    #             loss_X = loss_X / len(self.train_loader)
 
-            # for i, (parent_module, attr_name) in enumerate(self.weight_list):
-            #     # Compute loss for X
-            #     lora_layer.delta.data.copy_(Y[i])
-            # loss_Y = 0
-            # with torch.no_grad():
-            #     for batch in preloaded_batches:
-            #         loss_Y += self.model(**batch).loss.item()
-            #     loss_Y = loss_Y / len(self.train_loader)
-            # # Restore original weights
-            # lora_layer.delta.data.copy_(original_data)
+    #         for i, (parent_module, attr_name) in enumerate(self.weight_list):
+    #             # Compute loss for X
+    #             lora_layer.delta.data.copy_(Y[i])
+    #         loss_Y = 0
+    #         with torch.no_grad():
+    #             for batch in preloaded_batches:
+    #                 loss_Y += self.model(**batch).loss.item()
+    #             loss_Y = loss_Y / len(self.train_loader)
+    #         # Restore original weights
+    #         lora_layer.delta.data.copy_(original_data)
                 
-            for i, (parent_module, attr_name) in enumerate(self.weight_list):
-                column_name = f"{attr_name}_{i}"
-                # Compute inner product
-                # numerator_1 = (loss_Y - loss_X) - torch.sum(grad_X[i] * (Y[i]-X[i]))
-                # numerator_2 = (loss_X - loss_Y) - torch.sum(grad_Y[i] * (X[i]-Y[i]))
-                numerator = torch.sum((grad_X[i]-grad_Y[i])*(X[i]-Y[i])) +2*torch.norm(X[i]-Y[i],p='nuc')
-                denominator = torch.norm((X[i]-Y[i]), p='fro') ** 2
+    #         for i, (parent_module, attr_name) in enumerate(self.weight_list):
+    #             column_name = f"{attr_name}_{i}"
+    #             # Compute inner product
+    #             numerator_1 = (loss_Y - loss_X) - torch.sum(grad_X[i] * (Y[i]-X[i]))
+    #             numerator_2 = (loss_X - loss_Y) - torch.sum(grad_Y[i] * (X[i]-Y[i]))
+    #             # numerator = torch.sum((grad_X[i]-grad_Y[i])*(X[i]-Y[i])) +2*torch.norm(X[i]-Y[i],p='nuc')
+    #             denominator = torch.norm((X[i]-Y[i]), p='fro') ** 2
                 
-                # values_dict[column_name].append((numerator_1 / denominator).item())
-                # values_dict[column_name].append((numerator_2 / denominator).item())
-                values_dict[column_name].append((numerator/denominator).item())
+    #             values_dict[column_name].append((numerator_1 / denominator).item())
+    #             values_dict[column_name].append((numerator_2 / denominator).item())
+    #             #values_dict[column_name].append((numerator/denominator).item())
 
-            pd.DataFrame(values_dict).to_csv(save_path, index=False, mode='a', header=False)
+    #         pd.DataFrame(values_dict).to_csv(save_path, index=False, mode='a', header=False)
             
-        return pd.DataFrame(values_dict)
+    #     return pd.DataFrame(values_dict)
 
 
 if __name__ == "__main__":
@@ -479,6 +518,7 @@ if __name__ == "__main__":
     tuning_weights = 'all'
     RSCM_rank = 8
     lmbda = 0.005
+    epsilon = 0.001
 
     # Load the model, pretrained and classifier-trained and fine tuned
     pretrained_model =  Model_Pretrained(model_name=model_name, dataset_name=dataset_name, fine_tuned=True, rank = 0, tuning_weights= tuning_weights).get_model()
@@ -487,18 +527,18 @@ if __name__ == "__main__":
     train_dataset = CustomDataset(task_name='sst2', split="train")
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=500)
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =epsilon, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=500)
 
-    save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv'
-    RSCM = checker.raw_RSCM(save_path)
+    # save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSCM.csv'
+    # RSCM = checker.raw_RSCM(save_path)
 
     #RSCM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_rawRSCM_test.csv', index = False)
 
-    # save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv'
-    # print(f'RSC for rank {RSCM_rank}')
-    # RSC = checker.RSC(save_path)
+    save_path = f'../Final_RSCM/{dataset_name}_{tuning_weights}_{RSCM_rank}_{epsilon}_RSC.csv'
+    print(f'RSC for rank {RSCM_rank}')
+    RSC = checker.RSC(save_path)
 
-    # save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv'
+    # save_path = f'../RSC_RSM/{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv'
     # print(f'RSM for rank {RSCM_rank}')
     # RSM = checker.RSM(save_path)
     
