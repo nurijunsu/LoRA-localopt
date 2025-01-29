@@ -155,82 +155,82 @@ class RSCM_checker:
 
         return accumulated_gradient
 
-    def compute_Hessian_vector_prod(self, weight_config, delta: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the scalar value of direction^T H direction, where H is the Hessian
-        of the loss function with respect to delta.
-        Args:
-            delta: The perturbation tensor.
-            direction: The vector to compute the Hessian product with.
-        Returns:
-            hvp_scalar: The scalar value of direction^T H direction.
-        """
-        # Ensure delta requires gradient
-        parent_module, attr_name = weight_config
-        lora_layer = getattr(parent_module, attr_name)
-        if not isinstance(lora_layer, LoRALayer):
-            raise TypeError(f"{attr_name} is not nn.Linear but {type(lora_layer)}")
+    # def compute_Hessian_vector_prod(self, weight_config, delta: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Compute the scalar value of direction^T H direction, where H is the Hessian
+    #     of the loss function with respect to delta.
+    #     Args:
+    #         delta: The perturbation tensor.
+    #         direction: The vector to compute the Hessian product with.
+    #     Returns:
+    #         hvp_scalar: The scalar value of direction^T H direction.
+    #     """
+    #     # Ensure delta requires gradient
+    #     parent_module, attr_name = weight_config
+    #     lora_layer = getattr(parent_module, attr_name)
+    #     if not isinstance(lora_layer, LoRALayer):
+    #         raise TypeError(f"{attr_name} is not nn.Linear but {type(lora_layer)}")
     
-        original_data = lora_layer.delta.data.clone()
-        delta.requires_grad_(True)
+    #     original_data = lora_layer.delta.data.clone()
+    #     delta.requires_grad_(True)
 
-        #Run on a subset dataset for fast running and debugging
-        # subset_dataset = torch.utils.data.Subset(self.train_dataset, range(100))  # Use a subset
-        # subset_loader = DataLoader(
-        #     subset_dataset, 
-        #     batch_size = self.batch_size,
-        #     shuffle = False, 
-        #     collate_fn=self.train_loader.collate_fn
-        # )
+    #     #Run on a subset dataset for fast running and debugging
+    #     # subset_dataset = torch.utils.data.Subset(self.train_dataset, range(100))  # Use a subset
+    #     # subset_loader = DataLoader(
+    #     #     subset_dataset, 
+    #     #     batch_size = self.batch_size,
+    #     #     shuffle = False, 
+    #     #     collate_fn=self.train_loader.collate_fn
+    #     # )
 
-        lora_layer.delta = nn.Parameter(delta.clone(), requires_grad=True)
+    #     lora_layer.delta = nn.Parameter(delta.clone(), requires_grad=True)
 
         
-        hvp_scalar = 0.0
-        # Compute the loss
-        for batch in tqdm(self.train_loader):  
-            loss=0.0          
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            with autocast():
-                loss = self.model(**batch).loss / len(self.train_loader)
+    #     hvp_scalar = 0.0
+    #     # Compute the loss
+    #     for batch in tqdm(self.train_loader):  
+    #         loss=0.0          
+    #         batch = {k: v.to(self.device) for k, v in batch.items()}
+    #         with autocast():
+    #             loss = self.model(**batch).loss / len(self.train_loader)
 
-            self.model.zero_grad()
-            loss.backward(create_graph = True)
-            # Compute the first gradient (grad of loss w.r.t. delta)
-            with autocast():
-                grad = lora_layer.delta.grad
-            # Compute the dot product of grad and direction
-            grad_dot_direction = torch.dot(grad.view(-1), direction.view(-1))
+    #         self.model.zero_grad()
+    #         loss.backward(create_graph = True)
+    #         # Compute the first gradient (grad of loss w.r.t. delta)
+    #         with autocast():
+    #             grad = lora_layer.delta.grad
+    #         # Compute the dot product of grad and direction
+    #         grad_dot_direction = torch.dot(grad.view(-1), direction.view(-1))
             
-            grad_dot_direction.backward()
+    #         grad_dot_direction.backward()
             
-            # Compute the second gradient (Hessian-vector product)
-            hessian_vector = lora_layer.delta.grad
+    #         # Compute the second gradient (Hessian-vector product)
+    #         hessian_vector = lora_layer.delta.grad
             
-            # Compute the scalar value of direction^T H direction
-            hvp_scalar += torch.dot(hessian_vector.view(-1), direction.view(-1))
+    #         # Compute the scalar value of direction^T H direction
+    #         hvp_scalar += torch.dot(hessian_vector.view(-1), direction.view(-1))
 
-            # Detach gradients to prevent graph retention
-            grad = grad.detach()
-            grad_dot_direction = grad_dot_direction.detach()
-            hessian_vector = hessian_vector.detach()
+    #         # Detach gradients to prevent graph retention
+    #         grad = grad.detach()
+    #         grad_dot_direction = grad_dot_direction.detach()
+    #         hessian_vector = hessian_vector.detach()
 
-            # Delete intermediate variables to free memory
-            del loss
-            del grad
-            del grad_dot_direction
-            del hessian_vector
+    #         # Delete intermediate variables to free memory
+    #         del loss
+    #         del grad
+    #         del grad_dot_direction
+    #         del hessian_vector
 
-        # Clear gradients of delta for the next iteration
-        lora_layer.delta.grad.zero_()
+    #     # Clear gradients of delta for the next iteration
+    #     lora_layer.delta.grad.zero_()
 
-        # Optionally, clear cache and collect garbage
-        # torch.cuda.empty_cache()
-        # gc.collect()  
+    #     # Optionally, clear cache and collect garbage
+    #     # torch.cuda.empty_cache()
+    #     # gc.collect()  
 
-        lora_layer.delta.data.copy_(original_data)
+    #     lora_layer.delta.data.copy_(original_data)
         
-        return hvp_scalar
+    #     return hvp_scalar
     
     def compute_Hessian_vector_prod_full(self, delta, direction):
         """
@@ -253,7 +253,10 @@ class RSCM_checker:
                 delta[i]=delta[i].to(self.device)
                 original_data.append(lora_layer.delta.data.detach().cpu())
                 # delta[i].requires_grad_(True)
-                lora_layer.delta = nn.Parameter(delta[i].to(self.device), requires_grad=True)
+                # lora_layer.delta = nn.Parameter(delta[i].to(self.device), requires_grad=True)
+                with torch.no_grad():
+                    lora_layer.delta.copy_(delta[i])  # keep the same parameter object
+                lora_layer.delta.requires_grad_(True)
 
         # #Run on a subset dataset for fast running and debugging
         # subset_dataset = torch.utils.data.Subset(self.train_dataset, range(100))  # Use a subset
@@ -327,7 +330,6 @@ class RSCM_checker:
         Returns:
             the whole value list
         """
-        values_dict = defaultdict(list)
         delta_star = []
         subgrad_star = []
         
@@ -342,6 +344,7 @@ class RSCM_checker:
         
         for _ in range(self.num_samples):
             deltas = []
+            values_dict = defaultdict(list)
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
                 deltas.append(self.generate_local_rank_r(delta_star[i]))
             
@@ -375,7 +378,6 @@ class RSCM_checker:
         Compute β_local(X) for matrices X of rank ≤ test_rank within epsilon ball of delta_star.
         Uses random sampling followed by rank projection and validation.
         """
-        values_dict = defaultdict(list)
         delta_star = []
         direction = []
         for parent_module, attr_name in self.weight_list:
@@ -385,6 +387,7 @@ class RSCM_checker:
         
         for _ in range(self.num_samples):
             X = []      
+            values_dict = defaultdict(list)
             # Generate X with correct rank within epsilon ball
             for i in range(len(self.weight_list)):
                 X.append(self.generate_local_rank_r(delta_star[i]))
@@ -412,7 +415,7 @@ class RSCM_checker:
     
 
     
-    def raw_RSCM(self):
+    def raw_RSCM(self, save_path):
         values_dict = defaultdict(list)
          # Preload all batches to device to avoid redundant data transfers
         #preloaded_batches = [{k: v.to(self.device) for k, v in batch.items()} for batch in self.train_loader]
@@ -425,6 +428,7 @@ class RSCM_checker:
         for _ in range(self.num_samples):
             X = []
             Y = []
+            values_dict = defaultdict(list)
             for i, (parent_module, attr_name) in enumerate(self.weight_list):
                 X.append(self.generate_local_rank_r(delta_star[i]))
                 Y.append(self.generate_local_rank_r(delta_star[i]))
@@ -463,7 +467,9 @@ class RSCM_checker:
                 # values_dict[column_name].append((numerator_1 / denominator).item())
                 # values_dict[column_name].append((numerator_2 / denominator).item())
                 values_dict[column_name].append((numerator/denominator).item())
-    
+
+            pd.DataFrame(values_dict).to_csv(save_path, index=False, mode='a', header=False)
+            
         return pd.DataFrame(values_dict)
 
 
@@ -481,14 +487,18 @@ if __name__ == "__main__":
     train_dataset = CustomDataset(task_name='sst2', split="train")
 
     #Compute the RSC and RSM constants via monte-carlo sampling for num_sample samples
-    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=1)
-
-    RSCM = checker.raw_RSCM()
-    RSCM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_rawRSCM_test.csv', index = False)
+    checker= RSCM_checker(pretrained_model=pretrained_model, tuning_weights=tuning_weights, train_dataset=train_dataset, epsilon =1, lmbda = lmbda, RSCM_rank=RSCM_rank, num_samples=500)
 
     save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv'
-    RSC = checker.RSC(save_path)
+    RSCM = checker.raw_RSCM(save_path)
+
+    #RSCM.to_csv(f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_rawRSCM_test.csv', index = False)
+
+    # save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSC.csv'
+    # print(f'RSC for rank {RSCM_rank}')
+    # RSC = checker.RSC(save_path)
 
     # save_path = f'../RSC_RSM/{model_name}_{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv'
+    # print(f'RSM for rank {RSCM_rank}')
     # RSM = checker.RSM(save_path)
     
