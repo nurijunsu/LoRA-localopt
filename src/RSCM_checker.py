@@ -111,26 +111,25 @@ class RSCM_checker:
         return weight_list
     
     def generate_local_rank_r(self, X, A, B):         
-        for _ in range(100):
+        for _ in range(1000):
             # Much more conservative scaling
             # Scale by epsilon/(10 * sqrt(rank) * (1 + op_norm))
             # This accounts for:
             # 1. Cross terms in multiplication
             # 2. Rank of the matrices
             # 3. Original matrix magnitude
-            scale = self.epsilon / (10*math.sqrt(self.rank *768))
+            scale = self.epsilon / (10*math.sqrt(self.rank*768))
 
             A_p = A + torch.randn_like(A) * torch.rand(1).item()* scale
-            B_p = B + torch.randn_like(B) * scale
+            B_p = B + torch.randn_like(B) * torch.rand(1).item()* scale
             
             # Reconstruct matrix as AB^T
             X_p = A_p @ B_p.T
-            
             if torch.norm(X_p - X, p='fro') < self.epsilon:
                 return X_p.to(self.device)
 
         print("failed to generate local matrix. Try smaller scale")
-        return X
+        return 
 
     def compute_gradient(self, delta=None):
         original_data = []
@@ -387,9 +386,9 @@ class RSCM_checker:
                 # Compute difference
                 diff = deltas[i] - delta_star[i]
                 # Compute inner product
-                u,_,v = torch.linalg.svd(star_gradient[i], full_matrices= False)
-                star_g = -self.lmbda * (u @ v)
-                numerator = torch.sum((grad[i] - star_g)* diff)
+                # u,_,v = torch.linalg.svd(star_gradient[i], full_matrices= False)
+                # star_g = -self.lmbda * (u @ v)
+                numerator = torch.sum((grad[i] - star_gradient[i])* diff)
                 # numerator_sub = torch.sum((subgrad- subgrad_star[i])* diff)
                 denominator = torch.norm(diff, p='fro') ** 2
                 alpha = (numerator / denominator).item()
@@ -429,6 +428,7 @@ class RSCM_checker:
                 # Compute compact A and B components (m×r and n×r matrices)
                 A = U_r @ torch.diag(S_sqrt)  # m×r
                 B = V_r @ torch.diag(S_sqrt)  # n×r
+                
                 X.append(self.generate_local_rank_r(delta_star[i], A, B))
                 m, n = X[i].shape
             
@@ -515,10 +515,10 @@ class RSCM_checker:
 if __name__ == "__main__":
     model_name = 'roberta'
     dataset_name = 'sst2'
-    tuning_weights = 'all'
-    RSCM_rank = 8
-    lmbda = 0.005
-    epsilon = 0.001
+    tuning_weights = 'last'
+    RSCM_rank = 32
+    lmbda = 0.01
+    epsilon = 5
 
     # Load the model, pretrained and classifier-trained and fine tuned
     pretrained_model =  Model_Pretrained(model_name=model_name, dataset_name=dataset_name, fine_tuned=True, rank = 0, tuning_weights= tuning_weights).get_model()
@@ -538,7 +538,7 @@ if __name__ == "__main__":
     print(f'RSC for rank {RSCM_rank}')
     RSC = checker.RSC(save_path)
 
-    # save_path = f'../RSC_RSM/{dataset_name}_{tuning_weights}_{RSCM_rank}_RSM.csv'
+    # save_path = f'../Final_RSCM/{dataset_name}_{tuning_weights}_{RSCM_rank}_{epsilon}_RSM.csv'
     # print(f'RSM for rank {RSCM_rank}')
     # RSM = checker.RSM(save_path)
     
