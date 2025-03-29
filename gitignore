@@ -1,0 +1,6 @@
+logs/
+RSCM
+pretrained_models/
+data/
+pycache
+wandb
