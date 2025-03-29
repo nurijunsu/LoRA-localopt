@@ -12,6 +12,7 @@ import wandb
 import json
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
+import multiprocessing as mp
 
 class LoRALayer(nn.Linear):
     #LoRA implementation for a linear layer
@@ -20,7 +21,7 @@ class LoRALayer(nn.Linear):
             in_features: int,
             out_features: int, 
             r: int,
-            lora_alpha: int =0,
+            lora_alpha: int =4,
             local_init: str = "True",
             **kwargs
     ):
@@ -38,23 +39,25 @@ class LoRALayer(nn.Linear):
         self.local_init = local_init
 
         self.reset_parameters()
-        
 
     def reset_parameters(self):
+        print("resetting parameters")
         nn.Linear.reset_parameters(self) 
         if hasattr(self, 'lora_A'):
             if self.local_init=="True":
                 # initialize B the same way as the default for nn.Linear and A to zero
                 nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
                 nn.init.zeros_(self.lora_B)
-                print('locally initialized')
             elif self.local_init == "LargeRandom":
-                nn.init.normal_(self.lora_A, mean=0, std=1/5)
-                nn.init.normal_(self.lora_B, mean=0, std=1/5)
+                nn.init.normal_(self.lora_A, mean=0, std=1/4)
+                nn.init.normal_(self.lora_B, mean=0, std=1/4)
+                # with torch.no_grad():
+                #     self.lora_A[0, 0] = 10 
+                #     self.lora_B[1, 1] = -10
                 print('initialized with large random')
             elif self.local_init == "Ortho":
                 with torch.no_grad():
-                    nn.init.normal_(self.lora_A, mean=0, std=1/20)
+                    nn.init.normal_(self.lora_A, mean=-1/20, std=1/20)
                     self.lora_B.data.copy_(self.lora_A.T) 
             # nn.init.constant_(self.lora_A, 10)  # Large positive constant
                 # nn.init.constant_(self.lora_B, -10)  # Large negative constant
@@ -64,6 +67,12 @@ class LoRALayer(nn.Linear):
                 #     self.lora_A[0, 0] = 50  # Only one large value in A
                 #     self.lora_B[0, 0] = -50  # Only one large value in B`
                 print('orthogonally initialized')
+            elif self.local_init == "SingleValue":
+                nn.init.zeros_(self.lora_A)
+                nn.init.zeros_(self.lora_B)
+                with torch.no_grad():
+                    self.lora_A[0, 0] = 35 
+                    self.lora_B[0, 0] = 35
 
     
     def forward(self, x:torch.Tensor):
@@ -88,18 +97,20 @@ class FineTuningTrainer:
         model: nn.Module, 
         tuning_weights: str = "all",    # one, last, or all
         rank: int = 16,                  # full fine tuning if rank=0
-        rank_star: int = 5,               # rank of global min    
+        rank_star: int = 4,               # rank of global min    
         lmbda: float = 0.01,            # Weight decay OR nuclear-norm coefficient
         L2_reg: bool = False,
         local_initialization: bool = True,
         num_epochs: int = 100,
+        save_epoch: int = 10,
         learning_rate: float = 5e-3,
         batch_size:int = 128,
-        grad_clip: float = 50.0,
-        device: str = "cuda",
+        grad_clip: float = 10,
+        device: str = "cuda:0",
         project_name: str = None, 
         run_name: str = None,
         log_dir : str = None, 
+        run_wandb: bool = True,
         optimizer: str = "SGD",  #SGD  #Adam
         lr_scheduler: str = None, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
         proximal_gradient: bool = False # Only for full fine tuning (rank=0)
@@ -111,10 +122,10 @@ class FineTuningTrainer:
             lora: If True, apply LoRA to the specified layers; if False, do standard full fine-tuning with nuclear norm regularization.
             rank: Rank used in LoRA; ignored if lora=False.
             lmbda: Regularization coefficient. If lora=True, this acts as weight decay; if lora=False, it is nuclear-norm coefficient.
-            local_initialization: If True, standard LoRA init; if False, “exploding” init.
+            local_initialization: If True, standard LoRA init; if False, "exploding" init.
             num_epochs: Number of epochs to train.
             learning_rate: Learning rate for the AdamW optimizer.
-            device: 'cuda' or 'cpu'.
+            device: Specific CUDA device (e.g., 'cuda:0', 'cuda:1') or 'cpu'.
         """
         self.model = model
         self.train_dataset = train_dataset
@@ -125,15 +136,29 @@ class FineTuningTrainer:
         self.lmbda = lmbda 
         self.L2_reg = L2_reg
         self.num_epochs = num_epochs
+        self.save_epoch = save_epoch
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.grad_clip = grad_clip
+        
+        # Validate and set device
+        if device.startswith('cuda:'):
+            gpu_idx = int(device.split(':')[1])
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is not available")
+            if gpu_idx >= torch.cuda.device_count():
+                raise ValueError(f"GPU {gpu_idx} is not available. Only {torch.cuda.device_count()} GPUs found.")
+        elif device != 'cpu':
+            raise ValueError("Device must be either a specific CUDA device (e.g., 'cuda:0') or 'cpu'")
         self.device = device
+        
         self.project_name = project_name
+        self.run_wandb = run_wandb
+        self.run_name = run_name
         self.proximal_gradient = proximal_gradient                                                                
 
         # 1. Unfreeze or transform the relevant layers
-        self.model = self.model.to(device)
+        self.model = self.model.to(self.device)
         # 2. Build optimizer (and optionally a scheduler)
         if optimizer == "SGD":
             self.optimizer = SGD(self._get_trainable_params(), lr=self.learning_rate, momentum = 0.0 if (L2_reg or proximal_gradient or self.rank>0) else 0.9)
@@ -141,7 +166,7 @@ class FineTuningTrainer:
             self.optimizer = Adam(self._get_trainable_params(), lr=self.learning_rate)
 
         if lr_scheduler == "ReduceLROnPlateu":
-            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, threshold = 0.002, patience=5, min_lr=5e-7) 
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, threshold = 0.0005, patience=3, min_lr=5e-7) 
         elif lr_scheduler == "CosineAnnealing":
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                                     self.optimizer,
@@ -153,12 +178,14 @@ class FineTuningTrainer:
             self.lr_scheduler = get_scheduler(
                                         name="cosine",
                                         optimizer=self.optimizer,
-                                        num_warmup_steps= round(0.05 * self.num_epochs),
+                                        num_warmup_steps= round(0.01 * self.num_epochs),
                                         num_training_steps= self.num_epochs
-                                    )   
+                                    )               
         elif lr_scheduler == "LinearWarmup":
             warmup_steps = 0.05 * self.num_epochs
             self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / warmup_steps))
+        elif lr_scheduler == "LinearDecay":
+            self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=lambda step: 1- step/self.num_epochs)
         else:
             self.lr_scheduler = None
                                                    
@@ -187,19 +214,21 @@ class FineTuningTrainer:
             'proximal_gradient' : self.proximal_gradient
         }
         self.save_config()
-        if project_name is not None:
+        if run_wandb:
             wandb.init(project=project_name, config=self.config, name=run_name)
 
     def save_config(self):
-        os.makedirs(f"{self.log_dir}", exist_ok=True)
-        config_path = os.path.join(f"{self.log_dir}", 'config.json')
+        os.makedirs(f"{self.log_dir}/{self.project_name}/", exist_ok=True)
+        config_path = os.path.join(f"{self.log_dir}/{self.project_name}/", f'{self.run_name}_config.json')
         with open(config_path, 'w') as json_file:
             json.dump(self.config, json_file,   indent=4)
 
     def save_model(self, epochs):
-        save_path = f"{self.log_dir}/lambda_{self.lmbda}_epoch_{epochs}_lr.pth"
-        torch.save(self.model.state_dict(), save_path)
-        print(f"Model weights saved to {save_path}")
+        if self.project_name is not None:
+            save_path = f"{self.log_dir}/{self.project_name}/{self.run_name}_epoch_{epochs}.pth"
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save(self.model.state_dict(), save_path)
+            print(f"Model weights saved to {save_path}")
 
     def _get_trainable_params(self):
         """
@@ -242,8 +271,8 @@ class FineTuningTrainer:
                 # Compute rank based on the threshold
                 threshold = 1e-3 * min(S[0],1)
                 rank.append(torch.sum(S > threshold).item())
-                sigma_r.append(S[rank[-1]-1])
-                sigma_r_star.append(S[self.rank_star])
+                sigma_r.append(S[self.rank-1])
+                sigma_r_star.append(S[self.rank_star-1])
         else:
             for i in range(0, len(params_list), 2):
                 A = params_list[i]     # Get A matrix
@@ -255,157 +284,157 @@ class FineTuningTrainer:
 
                 # Compute rank based on the threshold
                 rank.append(torch.sum(S > threshold).item())
-                sigma_r.append(S[rank[-1]-1])
-                sigma_r_star.append(S[self.rank_star])
+                sigma_r.append(S[self.rank-1])
+                sigma_r_star.append(S[self.rank_star-1])
 
         return sigma_r, sigma_r_star, rank
 
     
     
     def train(self):
-
-        # def hook_fn(module, input, output):
-        #     print(f"[Hook] Module: {module.__class__.__name__}")
-        #     print(f"Input Shapes: {[i.shape for i in input if isinstance(i, torch.Tensor)]}")
-        #     print(f"Output Shape: {output.shape if isinstance(output, torch.Tensor) else type(output)}")
-
-        # # Register hooks for all modules in the model
-        # for name, module in self.model.named_modules():
-        #     module.register_forward_hook(hook_fn)
         scaler = GradScaler()
 
         for epoch in range(self.num_epochs):
-            self.model.train()
-            total_loss = 0.0
-            total_reg = 0.0
-
-            def collate_fn(batch):
-                # Each item is a dict with 'input_ids', 'attention_mask', 'labels', etc.
-                # They are all the same length (since we used padding="max_length").
-                input_ids = torch.stack([torch.tensor(x["input_ids"]) for x in batch], dim=0)
-                attention_mask = torch.stack([torch.tensor(x["attention_mask"]) for x in batch], dim=0)
-                labels = torch.tensor([x["labels"] for x in batch], dtype=torch.long)
-
-                return {
-                    "input_ids": input_ids.to(self.device),
-                    "attention_mask": attention_mask.to(self.device),
-                    "labels": labels.to(self.device),
-                }
-            
-            if hasattr(self.model, 'roberta'):
-                train_loader = DataLoader(
-                    self.train_dataset,
-                    batch_size=self.batch_size,
-                    shuffle=True,
-                    collate_fn=collate_fn
-                )
-            else: 
-                train_loader = DataLoader(
-                    self.train_dataset,
-                    batch_size=self.batch_size,
-                    shuffle=True,
-                )
-
-            for batch in tqdm(train_loader):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                self.optimizer.zero_grad()
-                # forward pass
-                with autocast():
-                    outputs = self.model(**batch)
-                    vanilla_loss = outputs.loss
-
-                    trainable_params = self._get_trainable_params()
-                    # If not using LoRA, apply nuclear norm regularization
-                    if self.rank == 0:
-                        # Only apply nuclear norm to the Q/V weights we are training
-                        if self.proximal_gradient:
-                            reg_loss = 0
-                        else:
-                            nuc_norm = self._compute_nuclear_norm(trainable_params)
-                            reg_loss = self.lmbda * nuc_norm                        
-                    else:
-                        if self.L2_reg:
-                            L2_norm =  sum(torch.norm(B @ A, p='fro')**2 for A, B in zip(trainable_params[::2], trainable_params[1::2]))
-                        else: 
-                            L2_norm = sum((matrix ** 2).sum() for matrix in trainable_params)
-                        reg_loss = self.lmbda * L2_norm/2 
-                    loss = vanilla_loss + reg_loss
-
-                scaler.scale(loss).backward()
-                scaler.unscale_(self.optimizer)
-
-                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.grad_clip)
-                scaler.step(self.optimizer)
-                scaler.update()
-                learning_rate = self.optimizer.param_groups[0]['lr']
-                if self.proximal_gradient:
-                    nuc_norm = 0
-                    for i, (name, param) in enumerate(self.model.named_parameters()):
-                        if "delta" in name and self.lmbda >= 1e-8: #Skip this if there is no weight decay (lmbda= 0)                       
-                            with torch.no_grad():
-                                u,s,v = torch.linalg.svd(param, full_matrices= False)
-                                s = torch.nn.Threshold(0, 0)(s- learning_rate * self.lmbda)  #Soft-thresholding operator 
-                                param.data = (u @ torch.diag(s)) @ v
-                                nuc_norm += s.sum()
-                                if self.project_name is not None:
-                                    wandb.log({
-                                        f"train/rank_{i}": torch.sum(s> 1e-8).item()
-                                    }, step = self.global_step)   
-                total_loss += vanilla_loss.item()
-                total_reg += reg_loss.item()
-
-                if self.project_name is not None:
-                    wandb.log({
-                        "train/vanilla_loss": vanilla_loss,
-                        "train/reg": nuc_norm if self.rank ==0 else L2_norm/2,
-                        "train/loss": loss.item(),
-                        "train/learning_rate": learning_rate,
-                        "train/grad_norm": grad_norm,
-                        "epoch": epoch
-                    }, step = self.global_step)
-
-                self.global_step +=1
-
-            # Validation step (optional)
-            val_acc = self.evaluate()['accuracy']
-
-            # Compute rank(\Delta W) at end of epoch
-            trainable_params = self._get_trainable_params()
-            sigma_r , sigma_r_star, rank_deltaW = self._compute_rank_of_deltas(trainable_params)
-            nuc_norm = self._compute_nuclear_norm(trainable_params)
-            self.train_loss = total_loss/len(train_loader)
-            reg_loss = total_reg/len(train_loader)
-            if self.lr_scheduler is not None:
-                if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.lr_scheduler.step(self.train_loss)  # Pass train_loss for ReduceLROnPlateau
-                else:
-                    self.lr_scheduler.step()  # Call step() for other schedulers
-            
-            print(f"Epoch [{epoch+1}/{self.num_epochs}], "
-                  f"Train Loss: {self.train_loss:.4f}, "
-                  f"Val Accuracy: {val_acc:.4f}, "
-                  f"Rank(ΔW): {rank_deltaW}")
-            
-            if self.project_name is not None:
-                if (epoch+1)% 50 ==0:
-                    self.save_model(epoch+1)
-
-                wandb.log({
-                        "test/total_train_loss": self.train_loss,
-                        "test/val_acc": val_acc,
-                        "test/reg_loss": reg_loss,
-                        "test/nuc_norm": nuc_norm,
-                        **{f"test/rank_{i}": rank_deltaW[i] for i in range(len(rank_deltaW))}, 
-                        **{f"test/sigma_r_{i}": sigma_r[i] for i in range(len(sigma_r))}, 
-                        **{f"test/sigma_r_star_{i}": sigma_r_star[i] for i in range(len(sigma_r_star))}, 
-                        "test/sigma_ratio(weight 1)": sigma_r_star[1]/sigma_r[1],
-                        "epoch": epoch  
-                    }, step = self.global_step)
+            self.train_one_epoch(epoch, scaler)
         
         if self.project_name is not None:
             wandb.finish()
             self.save_model(self.num_epochs)
-            
+
+    def train_one_epoch(self, epoch, scaler):
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        total_reg = 0.0
+
+        def collate_fn(batch):
+            input_ids = torch.stack([torch.tensor(x["input_ids"]) for x in batch], dim=0)
+            attention_mask = torch.stack([torch.tensor(x["attention_mask"]) for x in batch], dim=0)
+            labels = torch.tensor([x["labels"] for x in batch], dtype=torch.long)
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
+        
+        if hasattr(self.model, 'roberta'):
+            train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                collate_fn=collate_fn,
+                num_workers=0,  # Disable multiprocessing for DataLoader
+                pin_memory=True
+            )
+        else: 
+            train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=0,  # Disable multiprocessing for DataLoader
+                pin_memory=True
+            )
+
+        # Get the process ID for multiprocessing environments
+        try:
+            process_id = mp.current_process().name
+            is_main_process = ("MainProcess" in process_id) or ("Model-1" in process_id)
+        except:
+            is_main_process = True  # Default to showing progress bar if not in multiprocessing
+
+        # Create a progress bar with a description that includes the process information
+        desc = f"Epoch {epoch+1}" if is_main_process else f"Process {process_id} - Epoch {epoch+1}"
+        for batch in tqdm(train_loader, desc=desc, disable=not is_main_process):
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            self.optimizer.zero_grad()
+            # forward pass
+            with autocast():
+                outputs = self.model(**batch)
+                vanilla_loss = outputs.loss
+
+                trainable_params = self._get_trainable_params()
+                # If not using LoRA, apply nuclear norm regularization
+                if self.rank == 0:
+                    # Only apply nuclear norm to the Q/V weights we are training
+                    if self.proximal_gradient:
+                        reg_loss = 0
+                    else:
+                        nuc_norm = self._compute_nuclear_norm(trainable_params)
+                        reg_loss = self.lmbda * nuc_norm                        
+                else:
+                    if self.L2_reg:
+                        L2_norm =  sum(torch.norm(B @ A, p='fro')**2 for A, B in zip(trainable_params[::2], trainable_params[1::2]))
+                    else: 
+                        L2_norm = sum((matrix ** 2).sum() for matrix in trainable_params)
+                    reg_loss = self.lmbda * L2_norm/2 
+                loss = vanilla_loss + reg_loss
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(self.optimizer)
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.grad_clip)
+            scaler.step(self.optimizer)
+            scaler.update()
+            learning_rate = self.optimizer.param_groups[0]['lr']
+            if self.proximal_gradient:
+                nuc_norm = 0
+                for i, (name, param) in enumerate(self.model.named_parameters()):
+                    if "delta" in name and self.lmbda >= 1e-8: #Skip this if there is no weight decay (lmbda= 0)                       
+                        with torch.no_grad():
+                            u,s,v = torch.linalg.svd(param, full_matrices= False)
+                            s = torch.nn.Threshold(0, 0)(s- learning_rate * self.lmbda)  #Soft-thresholding operator 
+                            param.data = (u @ torch.diag(s)) @ v
+                            nuc_norm += s.sum()
+                            if self.run_wandb:
+                                wandb.log({
+                                    f"train/rank_{i}": torch.sum(s> 1e-8).item()
+                                }, step = self.global_step)   
+            total_loss += vanilla_loss.item()
+            total_reg += reg_loss.item()
+
+            if self.run_wandb:
+                wandb.log({
+                    "train/vanilla_loss": vanilla_loss,
+                    "train/reg": nuc_norm if self.rank ==0 else L2_norm/2,
+                    "train/loss": loss.item(),
+                    "train/learning_rate": learning_rate,
+                    "train/grad_norm": grad_norm,
+                    "epoch": epoch
+                }, step = self.global_step)
+
+            self.global_step +=1
+
+        # Validation step
+        val_acc = self.evaluate()['accuracy']
+
+        # Compute rank(\Delta W) at end of epoch
+        trainable_params = self._get_trainable_params()
+        nuc_norm = self._compute_nuclear_norm(trainable_params)
+        self.train_loss = total_loss/len(train_loader)
+        reg_loss = total_reg/len(train_loader)
+        if self.lr_scheduler is not None:
+            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                self.lr_scheduler.step(self.train_loss)  # Pass train_loss for ReduceLROnPlateau
+            else:
+                self.lr_scheduler.step()  # Call step() for other schedulers
+        
+        print(f"Epoch [{epoch+1}/{self.num_epochs}], "
+              f"Train Loss: {self.train_loss:.4f}, "
+              f"Val Accuracy: {val_acc:.4f}, "
+              )
+        
+        if self.run_wandb:
+            if (epoch+1)% self.save_epoch ==0:
+                self.save_model(epoch+1)
+
+            wandb.log({
+                    "test/total_train_loss": self.train_loss,
+                    "test/val_acc": val_acc,
+                    "test/reg_loss": reg_loss,
+                    "test/nuc_norm": nuc_norm,
+                    "epoch": epoch  
+                }, step = self.global_step)
 
     def evaluate(self, test_dataset = None):
         dataset = test_dataset if test_dataset is not None else self.test_dataset
@@ -415,14 +444,13 @@ class FineTuningTrainer:
         self.model.eval()
 
         def collate_fn(batch):
-            # batch is a list of items from dataset[i]
             input_ids = torch.stack([torch.tensor(x["input_ids"]) for x in batch], dim=0)
             attention_mask = torch.stack([torch.tensor(x["attention_mask"]) for x in batch], dim=0)
             labels = torch.tensor([x["labels"] for x in batch], dtype=torch.long)
             return {
-                "input_ids": input_ids.to(self.device),
-                "attention_mask": attention_mask.to(self.device),
-                "labels": labels.to(self.device),
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
             }
 
         if isinstance(self.model, transformers.RobertaForSequenceClassification):

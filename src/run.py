@@ -9,17 +9,20 @@ import argparse
 
 def parse_args():
     parse = argparse.ArgumentParser()
-    parse.add_argument('--task_name', type=str, help='fine tuning task')
-    parse.add_argument('--lmbda', type=float, help='weight decay parameter')
-    parse.add_argument('--tuning_weights', type=str, help='finetuning type')
-    parse.add_argument('--learning_rate', type=float, help ='learning rate')
-    parse.add_argument('--rank', type=int, help ='rank')
-    parse.add_argument('--local_init', type=str, help ='local initialization')
-    parse.add_argument('--Scheduler', type=str, help ='Learning Rate Scheduler')
+    parse.add_argument('--device', type=str, help='device')
+    parse.add_argument('--task_name', default='sst2', type=str, help='fine tuning task')
+    parse.add_argument('--lmbda', default=0.01, type=float, help='weight decay parameter')
+    parse.add_argument('--tuning_weights', default='all', type=str, help='finetuning type')
+    parse.add_argument('--learning_rate', default=0.001, type=float, help ='learning rate')
+    parse.add_argument('--rank', default=8, type=int, help ='rank')
+    parse.add_argument('--local_init', default='LargeRandom', type=str, help ='local initialization')
+    parse.add_argument('--Scheduler', default='None', type=str, help ='Learning Rate Scheduler')
+    parse.add_argument('--sample_ratio', default=1.0, type=float, help ='sample ratio')
     args = parse.parse_args()
     return args
 
-#python run.py --task_name sst2 --lmbda 0.01 --tuning_weights all --learning_rate 0.01 --rank 16 --local_init True --Scheduler CosineAnnealing
+#python run.py --device cuda:0 --task_name sst2 --lmbda 0.01 --tuning_weights all --learning_rate 0.005 --rank 8 --local_init LargeRandom --Scheduler CosineDecay
+torch.manual_seed(42)
 
 args = parse_args()
 task_name = args.task_name
@@ -33,13 +36,13 @@ rank = args.rank
 local_init = args.local_init
 Scheduler = args.Scheduler
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = args.device
 print(f"Using device: {device}")
 
 # Create custom datasets
-train_dataset = CustomDataset(task_name=task_name, split="train")
+train_dataset = CustomDataset(task_name=task_name, split="train", sample_ratio=args.sample_ratio)
 
-test_dataset = CustomDataset(task_name=task_name, split="test")
+test_dataset = CustomDataset(task_name=task_name, split="test", sample_ratio=args.sample_ratio)
 
 print("Datasets Created")
 
@@ -57,9 +60,6 @@ model = model_loader.get_model()
 
 print("Model Loaded")
 
-project_name=f'The Final Experiments_{task_name}'
-
-
 trainer= FineTuningTrainer(                                                                                                                                                          
         model = model,
         train_dataset = train_dataset,
@@ -69,15 +69,16 @@ trainer= FineTuningTrainer(
         lmbda = lmbda,            # Weight decay OR nuclear-norm coefficient
         L2_reg = False,
         local_initialization= local_init, #True, LargeRandom, Ortho
-        num_epochs = 100,
+        num_epochs = 500,
+        save_epoch = 100,
         learning_rate= learning_rate,
-        batch_size=64,
+        batch_size=len(train_dataset),
         device = device,
         optimizer = "SGD",
         proximal_gradient= True,
-        project_name=project_name,
+        project_name='Rebuttal_Sameglobalmin',
         lr_scheduler= Scheduler, #ReduceLROnPlateu, CosineAnnealing, CosineDecay, LinearWarmup
-        run_name = f"{tuning_weights}_spurious_rank{rank}"
+        run_name = "tryout3_fasttrain"
     )
 
 trainer.train()

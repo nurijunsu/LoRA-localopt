@@ -21,15 +21,19 @@ class CustomDataset(torch.utils.data.Dataset):
     - Provides train/test splits
     - Saves processed datasets locally to ../data to avoid repeated downloads/preprocessing
     """
-    def __init__(self, task_name, split="train"):
+    def __init__(self, task_name, split="train", sample_ratio=1.0, random_seed=42):
         """
         Args:
             task_name (str): one of "sst2", "qnli", "qqp", "cifar100", "superb_ic"
             split (str): "train" or "test"
+            sample_ratio (float): Fraction of dataset to use (default: 1.0 for full dataset)
+            random_seed (int): Seed for random sampling
         """
         self.task_name = task_name
         self.split = split
         self.data_dir = "../data"
+        self.sample_ratio = sample_ratio
+        self.random_seed = random_seed
 
         # Create data directory if it doesn't exist
         if not os.path.exists(self.data_dir):
@@ -47,9 +51,10 @@ class CustomDataset(torch.utils.data.Dataset):
         self.vit_name = "google/vit-base-patch16-224"
         self.wav2vec2_name = "facebook/wav2vec2-base"
 
+        print("Preparing dataset")
         self.dataset = self._prepare_dataset()
         #self.dataset.save_to_disk(self.processed_path)
-
+        print("Dataset prepared")
         # Now select the split
         if self.split not in self.dataset:
             raise ValueError(f"Split {self.split} not found in dataset {self.task_name}. Available splits: {list(self.dataset.keys())}")
@@ -66,7 +71,24 @@ class CustomDataset(torch.utils.data.Dataset):
         # For Vision: CIFAR-100
         # For Audio: SUPERB IC
         if self.task_name == "sst2":
+            print("Loading dataset")
             raw = load_dataset("glue", "sst2")
+            print("Dataset loaded")
+            
+            # Take first N% if sample_ratio < 1.0
+            if self.sample_ratio < 1.0:
+                print(f"Using first {int(self.sample_ratio * 100)}% of data")
+                # Calculate how many examples to keep
+                train_size = int(len(raw["train"]) * self.sample_ratio)
+                val_size = int(len(raw["validation"]) * self.sample_ratio)
+                
+                # Select the first N examples
+                raw = DatasetDict({
+                    "train": raw["train"].select(range(train_size)),
+                    "validation": raw["validation"].select(range(val_size))
+                })
+                print(f"Train size: {len(raw['train'])}, Validation size: {len(raw['validation'])}")
+            
             # We'll create a prompt:
             # "The sentiment of this sentence is <mask>. Sentence: {sentence}"
             # Labels: 0 = negative, 1 = positive
@@ -78,9 +100,23 @@ class CustomDataset(torch.utils.data.Dataset):
                 tokenized["labels"] = example["label"]
                 return tokenized
             processed = raw.map(preprocess_sst2, batched=False, remove_columns=raw["train"].column_names)
-
+           
         elif self.task_name == "qnli":
             raw = load_dataset("glue", "qnli")
+            
+            # Take first N% if sample_ratio < 1.0
+            if self.sample_ratio < 1.0:
+                print(f"Using first {int(self.sample_ratio * 100)}% of data")
+                # Calculate how many examples to keep
+                train_size = int(len(raw["train"]) * self.sample_ratio)
+                val_size = int(len(raw["validation"]) * self.sample_ratio)
+                
+                # Select the first N examples
+                raw = DatasetDict({
+                    "train": raw["train"].select(range(train_size)),
+                    "validation": raw["validation"].select(range(val_size))
+                })
+                
             # QNLI: Given question and sentence, is the sentence an answer to the question?
             # Labels: 0 = entailed, 1 = not_entailment
             # Prompt: "Given the question: {question}, does the following sentence answer it <mask>? {sentence}"
@@ -96,6 +132,20 @@ class CustomDataset(torch.utils.data.Dataset):
 
         elif self.task_name == "qqp":
             raw = load_dataset("glue", "qqp")
+            
+            # Take first N% if sample_ratio < 1.0
+            if self.sample_ratio < 1.0:
+                print(f"Using first {int(self.sample_ratio * 100)}% of data")
+                # Calculate how many examples to keep
+                train_size = int(len(raw["train"]) * self.sample_ratio)
+                val_size = int(len(raw["validation"]) * self.sample_ratio)
+                
+                # Select the first N examples
+                raw = DatasetDict({
+                    "train": raw["train"].select(range(train_size)),
+                    "validation": raw["validation"].select(range(val_size))
+                })
+            
             tokenizer = AutoTokenizer.from_pretrained(self.roberta_name, use_fast=True)
             
             def preprocess_qqp(example):
